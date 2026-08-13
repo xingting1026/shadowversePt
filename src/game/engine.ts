@@ -694,11 +694,18 @@ function aiTopSearchToHand(state: GameState, count: number, predicate: (card: Ca
   const cards = topCards(state, "ai", count);
   const candidates = cards.filter(predicate);
   const priority: Record<string, number> = {
-    manifestedLishenna: 15, destructionWilderness: 14, destructiveLishenna: 13,
-    annihilationSong: 12, dissonanceWorshipper: 11, destructionFanatic: 10,
-    originalLishenna: 9, whiteBlackChapter: 8,
+    axia: 18, manifestedLishenna: 17, annihilationSong: 16,
+    destructiveLishenna: 15, destructionWilderness: 14,
+    dissonanceWorshipper: 13, destructionFanatic: 12,
+    originalLishenna: 11, destructionPrayer: 10, whiteBlackChapter: 9,
   };
-  const picked = [...candidates].sort((a, b) => (priority[b.cardId] ?? 5) - (priority[a.cardId] ?? 5))[0];
+  const copiesAvailable = (cardId: string): number =>
+    [...state.ai.hand, ...state.ai.field].filter((item) => baseCardId(item) === cardId).length;
+  const picked = [...candidates].sort((a, b) => {
+    const aScore = (priority[a.cardId] ?? 5) - copiesAvailable(a.cardId) * 4;
+    const bScore = (priority[b.cardId] ?? 5) - copiesAvailable(b.cardId) * 4;
+    return bScore - aScore;
+  })[0];
   if (picked) {
     picked.zone = "hand";
     state.ai.hand.push(picked);
@@ -801,15 +808,31 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
   }
 }
 
-function aiSacrificeCandidate(state: GameState, excludeUid?: string): CardInstance | undefined {
+function aiSacrificeValue(state: GameState, card: CardInstance): number {
   const value: Record<string, number> = {
-    newWhite: 2, newBlack: 2, destructionWilderness: 3,
-    manifestedLishenna: 4, destructionHermit: 5, destructionPrayer: 7,
-    axiaEvo: 10, destructiveLishennaEvo: 10,
+    newWhite: state.ai.hp <= 12 ? -2 : 1,
+    newBlack: state.player.hp <= 8 ? -3 : 0,
+    destructionWilderness: state.ai.field.length >= 5 ? 2 : 5,
+    manifestedLishenna: 4,
+    destructionHermit: 6,
+    dissonanceWorshipper: 7,
+    destructionServant: 8,
+    destructionFanatic: 10,
+    destructionPrayer: card.tapped ? 8 : 13,
+    destructiveLishenna: 11,
+    originalLishenna: 12,
+    whiteArtifact: state.ai.hp <= 12 ? 17 : 12,
+    blackArtifact: state.player.hp <= 10 ? 19 : 14,
+    axiaEvo: 22,
+    destructiveLishennaEvo: 20,
   };
+  return value[card.cardId] ?? 9;
+}
+
+function aiSacrificeCandidate(state: GameState, excludeUid?: string): CardInstance | undefined {
   return state.ai.field
     .filter((item) => item.uid !== excludeUid && isIdolCard(item.cardId))
-    .sort((a, b) => (value[a.cardId] ?? 6) - (value[b.cardId] ?? 6))[0];
+    .sort((a, b) => aiSacrificeValue(state, a) - aiSacrificeValue(state, b))[0];
 }
 
 function resolveAiFanfare(state: GameState, source: CardInstance | undefined, cardId: string): void {
@@ -1765,8 +1788,8 @@ function aiCardValue(cardId: string): number {
     annihilationSong: 24,
     destructionWilderness: 23,
     dissonanceWorshipper: 22,
-    whiteArtifact: 21,
-    blackArtifact: 21,
+    whiteArtifact: 22,
+    blackArtifact: 27,
     destructionServant: 20,
     destructionPrayer: 19,
     destructionHermit: 18,
@@ -1779,6 +1802,16 @@ function aiCardValue(cardId: string): number {
   return values[cardId] ?? 5;
 }
 
+function aiQuickReserve(state: GameState): number {
+  const hasQuick = state.ai.hand.some((item) => item.cardId === "whiteBlackChapter");
+  if (!hasQuick || state.ai.pp < 2 || state.ai.maxPP < 4) return 0;
+  const target = bestFollower(state, "player", "kill");
+  if (!target) return 0;
+  const kills = remainingHealthOf(target) <= 2;
+  const highThreat = attackOf(target) >= 4 || target.cardId === "queenCynthia" || target.cardId === "fairyBladeAmatsu";
+  return kills || highThreat ? 2 : 0;
+}
+
 function aiPlayScore(state: GameState, card: CardInstance, zone: Zone): number {
   const def = definition(card);
   if (playableReason(state, card, zone, "ai")) return -999;
@@ -1786,15 +1819,39 @@ function aiPlayScore(state: GameState, card: CardInstance, zone: Zone): number {
   let score = aiCardValue(card.cardId) - def.cost * 1.2;
   const target = bestFollower(state, "player");
   const idols = idolField(state).length;
-  if (card.cardId === "destructionJoy") score += idols ? 20 : -30;
+  const idolPermanentAfterPlay = isIdolCard(card.cardId) && (isFollower(card) || isAmulet(card)) ? idols + 1 : idols;
+  const reserve = card.cardId === "whiteBlackChapter" ? 0 : aiQuickReserve(state);
+  if (reserve && state.ai.pp - def.cost < reserve) score -= 28 * (reserve - (state.ai.pp - def.cost));
+
+  if (card.cardId === "destructionJoy") {
+    const refundsPp = idols > 0 && state.ai.pp < state.ai.maxPP;
+    const drawsCard = state.ai.field.some((item) => item.cardId === "originalLishenna");
+    if (!refundsPp && !drawsCard) return -999;
+    score += (refundsPp ? 20 : 0) + (drawsCard ? 18 : 0);
+  }
   if (card.cardId === "annihilationSong") score += !eggField(state).length && canFitField(state, "ai") ? 30 : 18;
   if (card.cardId === "manifestedLishenna") score += !eggField(state).length && canFitField(state, "ai") ? 22 : 16;
-  if (card.cardId === "destructionHermit") score += idols >= 3 && target ? 18 : 0;
-  if (card.cardId === "destructionFanatic") score += idols >= 3 && target ? 30 : -10;
-  if (card.cardId === "whiteBlackChapter") score += target && remainingHealthOf(target) <= 2 ? 16 : -6;
-  if (card.cardId === "solo") score += target ? Math.min(20, idolField(state).filter((item) => !item.tapped).length * 4) : -50;
+  if (card.cardId === "destructionWilderness" && idols < 3) score += 8;
+  if (card.cardId === "dissonanceWorshipper" && state.ai.hand.length <= 5) score += 8;
+  if (card.cardId === "destructionHermit") score += idolPermanentAfterPlay >= 3 && target ? 24 : 0;
+  if (card.cardId === "destructionFanatic") score += idolPermanentAfterPlay >= 3 && target ? 42 : -24;
+  if (card.cardId === "destructiveLishenna") score += idolPermanentAfterPlay >= 3 && state.ai.ex.length < 5 ? 22 : 0;
+  if (card.cardId === "whiteBlackChapter") {
+    const bonusActive = idols >= 2;
+    const lethal = bonusActive && state.player.hp <= 2;
+    if (!lethal) return -999;
+    score += 100;
+  }
+  if (card.cardId === "solo") {
+    const standingIdols = idolField(state).filter((item) => !item.tapped).length;
+    const kills = target && standingIdols * 2 >= remainingHealthOf(target);
+    const dangerous = target && (attackOf(target) >= 4 || target.cardId === "queenCynthia" || target.cardId === "fairyBladeAmatsu");
+    score += target && (kills || dangerous) ? Math.min(42, standingIdols * 7) : -60;
+  }
   if (card.cardId === "returningDissonance") score += idols >= 2 ? 15 : -50;
-  if (card.cardId === "zelgenea") score += state.ai.hp <= 10 ? 22 : 0;
+  if (card.cardId === "whiteArtifact") score += state.ai.hp <= 12 ? 28 : state.ai.hp < 20 ? 12 : -4;
+  if (card.cardId === "blackArtifact") score += state.player.hp <= 10 ? 34 : 18;
+  if (card.cardId === "zelgenea") score += state.ai.hp <= 10 ? 40 : state.player.field.length ? 8 : -8;
   if (card.cardId === "greatZelgenea") score += state.player.hp <= 10 ? 60 : 20;
   if ((isFollower(card) || isAmulet(card)) && state.ai.field.length >= 4) score -= 8;
   return score;
@@ -1825,9 +1882,13 @@ function aiBestPlayable(state: GameState): { card: CardInstance; zone: Zone; sco
 function aiEvolvePriority(state: GameState, card: CardInstance): number {
   if (card.baseCardId || !definition(card).evolveId) return -999;
   const target = bestFollower(state, "player");
-  if (card.cardId === "destructiveLishenna") return 35;
-  if (card.cardId === "axia" && aiSacrificeCandidate(state, card.uid)) return 32;
-  if (card.cardId === "destructionServant" && target) return card.flags.freeEvolve ? 40 : 25;
+  if (card.cardId === "destructionServant" && target) return card.flags.freeEvolve ? 52 : 35;
+  if (card.cardId === "axia" && aiSacrificeCandidate(state, card.uid)) {
+    const hasEgg = eggField(state).length > 0;
+    const superTurn = isSuperEligible(state, "ai");
+    return 44 + (hasEgg ? 8 : 0) + (superTurn ? 12 : 0);
+  }
+  if (card.cardId === "destructiveLishenna") return state.ai.ex.length <= 3 ? 43 : 30;
   return -999;
 }
 
@@ -1873,16 +1934,46 @@ function aiUsePrayer(state: GameState): boolean {
   return true;
 }
 
-function aiCycleChapter(state: GameState): boolean {
+function aiChapterTapPenalty(state: GameState, card: CardInstance): number {
+  if (card.cardId === "destructionWilderness") return 1;
+  if (card.cardId === "manifestedLishenna") return 2;
+  if (card.cardId === "destructionHermit" || card.cardId === "dissonanceWorshipper") return 3;
+  if (card.cardId === "whiteArtifact") return state.ai.hp <= 12 ? 15 : 8;
+  if (card.cardId === "blackArtifact") return state.player.hp <= 10 ? 18 : 11;
+  if (card.cardId === "destructionPrayer") return 16;
+  if (card.cardId === "axiaEvo") return 20;
+  if (isFollower(card) && !canAttackNow(state, card)) return 2 + attackOf(card);
+  if (isFollower(card)) return 7 + attackOf(card) * 4;
+  return 6;
+}
+
+function aiChapterEffectValue(state: GameState, chapter: CardInstance): number {
+  let value = chapter.cardId === "newBlack" ? 2 : state.ai.hp < 20 ? 1.5 : 0.5;
+  const axiaReady = state.ai.field.some((item) => item.cardId === "axiaEvo" && !item.flags.axiaTriggered);
+  if (axiaReady && state.player.field.some(isFollower)) value += 3;
+  if (chapter.cardId === "newBlack" && state.player.hp <= 3) value += 20;
+  if (chapter.cardId === "newWhite" && state.ai.hp <= 8) value += 10;
+  return value;
+}
+
+function aiCycleChapter(state: GameState, preserveAttackers = true): boolean {
   const chapter = [...state.ai.field]
     .filter((item) => (item.cardId === "newWhite" || item.cardId === "newBlack") && !item.tapped)
     .sort((a, b) => Number(b.cardId === "newBlack") - Number(a.cardId === "newBlack"))[0];
   const standIdols = idolField(state).filter((item) => !item.tapped);
   if (!chapter || standIdols.length < 3) return false;
-  const costs = [chapter, ...standIdols.filter((item) => item.uid !== chapter.uid)].slice(0, 3);
+  const otherCosts = standIdols
+    .filter((item) => item.uid !== chapter.uid)
+    .sort((a, b) => aiChapterTapPenalty(state, a) - aiChapterTapPenalty(state, b));
+  const costs = [chapter, ...otherCosts.slice(0, 2)];
+  const lostAttack = costs
+    .filter((item) => item.uid !== chapter.uid && canAttackNow(state, item))
+    .reduce((total, item) => total + attackOf(item), 0);
+  if (preserveAttackers && lostAttack > aiChapterEffectValue(state, chapter)) return false;
   for (const card of costs) card.tapped = true;
+  const payment = costs.map((card) => cardName(card.cardId)).join("、");
   moveFieldToGrave(state, chapter, `${cardName(chapter.cardId)}起動費用`);
-  addLog(state, `破壞巫橫置3張偶像卡牌，破壞${chapter.cardId === "newBlack" ? "黑蛋" : "白蛋"}以觸發謝幕曲。`);
+  addLog(state, `破壞巫橫置「${payment}」3張偶像卡牌，破壞${chapter.cardId === "newBlack" ? "黑蛋" : "白蛋"}以觸發謝幕曲。`);
   runTasks(state);
   return true;
 }
@@ -1983,7 +2074,6 @@ function runAiTurnMutable(state: GameState): void {
   while (state.status === "playing" && state.turnSide === "ai" && !state.pending && guard < 40) {
     guard += 1;
     if (aiGraveWorld(state)) continue;
-    if (aiCycleChapter(state)) continue;
     if (tryAiEvolve(state)) {
       runTasks(state);
       continue;
@@ -1995,9 +2085,14 @@ function runAiTurnMutable(state: GameState): void {
       runTasks(state);
       continue;
     }
+    if (aiCycleChapter(state, true)) continue;
     break;
   }
   aiAttackPhase(state);
+  while (state.status === "playing" && state.turnSide === "ai" && !state.pending && guard < 48) {
+    guard += 1;
+    if (!aiCycleChapter(state, false)) break;
+  }
   if (state.status === "playing") aiEndPhase(state);
 }
 
@@ -2034,7 +2129,10 @@ export const __testing = {
   runTasks,
   resolveTask,
   aiCycleChapter,
+  aiBestPlayable,
+  aiPlayScore,
   aiCanCommitEvolveFollower,
   tryAiEvolve,
+  runAiTurnMutable,
   beginTurnMutable,
 };

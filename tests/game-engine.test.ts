@@ -173,6 +173,128 @@ test("the destruction AI immediately taps three Idol cards to break an available
   assert.equal(state.ai.hp, 21);
 });
 
+test("egg cycling logs every field card used as its three-card ACT cost", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  const white = addField(state, "ai", "newWhite");
+  const attacker = addField(state, "ai", "originalLishenna");
+  const wilderness = addField(state, "ai", "destructionWilderness");
+  const freshHermit = addField(state, "ai", "destructionHermit");
+  attacker.enteredAt = state.globalTurn - 1;
+  wilderness.enteredAt = state.globalTurn;
+  freshHermit.enteredAt = state.globalTurn;
+  __testing.addExDirect(state, "ai", ["whiteArtifact", "blackArtifact"]);
+
+  assert.equal(__testing.aiCycleChapter(state), true);
+  const paymentLog = state.log.find((entry) => entry.includes("3張偶像卡牌"));
+  assert.ok(paymentLog?.includes("新約・白の章"));
+  assert.ok(paymentLog?.includes("破壊の荒野"));
+  assert.ok(paymentLog?.includes("破壊の隠者"));
+  assert.equal(paymentLog?.includes("アーティファクト"), false);
+  assert.equal(attacker.tapped, false);
+  assert.equal(state.ai.field.some((card) => card.uid === white.uid), false);
+});
+
+test("egg cycling preserves attackers when their face damage is worth more than the chapter trigger", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  addField(state, "ai", "newBlack");
+  const lishenna = addField(state, "ai", "originalLishenna");
+  const fanatic = addField(state, "ai", "destructionFanatic");
+  lishenna.enteredAt = state.globalTurn - 1;
+  fanatic.enteredAt = state.globalTurn - 1;
+
+  assert.equal(__testing.aiCycleChapter(state), false);
+  assert.equal(lishenna.tapped, false);
+  assert.equal(fanatic.tapped, false);
+  assert.equal(__testing.aiCycleChapter(state, false), true);
+});
+
+test("the destruction AI does not waste Destruction's Joy at full PP without its draw condition", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  addField(state, "ai", "destructionHermit");
+  state.ai.maxPP = 3;
+  state.ai.pp = 3;
+  const joy = __testing.makeInstance(state, "destructionJoy", "ai", "hand");
+  assert.equal(__testing.aiPlayScore(state, joy, "hand"), -999);
+  state.ai.pp = 2;
+  assert.ok(__testing.aiPlayScore(state, joy, "hand") > 0);
+});
+
+test("the destruction AI keeps White Chapter Black Chapter as Quick unless its leader damage is lethal", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  state.player.field = [];
+  addField(state, "ai", "destructionHermit");
+  addField(state, "ai", "destructionWilderness");
+  addField(state, "player", "pureWaterFairy");
+  state.ai.maxPP = 4;
+  state.ai.pp = 4;
+  const quick = __testing.makeInstance(state, "whiteBlackChapter", "ai", "hand");
+  assert.equal(__testing.aiPlayScore(state, quick, "hand"), -999);
+  state.player.hp = 2;
+  assert.ok(__testing.aiPlayScore(state, quick, "hand") > 0);
+});
+
+test("the destruction AI deploys the black artifact before the white artifact while healthy", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  state.ai.ex = [];
+  state.ai.hand = [];
+  state.ai.maxPP = 2;
+  state.ai.pp = 2;
+  __testing.addExDirect(state, "ai", ["whiteArtifact", "blackArtifact"]);
+  const best = __testing.aiBestPlayable(state);
+  assert.equal(best?.card.cardId, "blackArtifact");
+});
+
+test("the destruction AI develops only cards that leave enough PP for a known Quick target", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  state.player.field = [];
+  addField(state, "ai", "destructionHermit");
+  addField(state, "ai", "destructionWilderness");
+  addField(state, "player", "pureWaterFairy");
+  state.ai.maxPP = 4;
+  state.ai.pp = 4;
+  const quick = __testing.makeInstance(state, "whiteBlackChapter", "ai", "hand");
+  const worshipper = __testing.makeInstance(state, "dissonanceWorshipper", "ai", "hand");
+  state.ai.hand = [quick, worshipper];
+  assert.equal(__testing.aiBestPlayable(state)?.card.cardId, "dissonanceWorshipper");
+  state.ai.pp = 3;
+  assert.equal(__testing.aiBestPlayable(state), undefined);
+});
+
+test("the destruction AI evolves Axia before considering an egg cycle", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.phase = "ai";
+  state.evolvedThisTurn = false;
+  state.ai.field = [];
+  state.ai.hand = [];
+  state.ai.ex = [];
+  state.ai.pp = 0;
+  state.ai.maxPP = 3;
+  state.ai.ep = 1;
+  state.ai.ownTurn = 3;
+  addField(state, "ai", "axia");
+  addField(state, "ai", "newWhite");
+  addField(state, "ai", "destructionHermit");
+
+  __testing.runAiTurnMutable(state);
+  const evolveIndex = state.log.findIndex((entry) => entry.includes("破壊の継承者・アクシア進化"));
+  const cycleIndex = state.log.findIndex((entry) => entry.includes("3張偶像卡牌"));
+  assert.ok(evolveIndex >= 0);
+  if (cycleIndex >= 0) assert.ok(cycleIndex < evolveIndex, "the later cycle should appear above evolve in the reverse-chronological log");
+});
+
 test("Axia is held until it can evolve immediately and has another Idol card to sacrifice", () => {
   const state = playing();
   state.turnSide = "ai";
@@ -256,11 +378,11 @@ function autoResolve(state: GameState): GameState {
   return current;
 }
 
-test("ten deterministic games advance through repeated player and AI turns without an unresolved loop", () => {
-  for (let seed = 1; seed <= 10; seed += 1) {
+test("fifty deterministic games advance through repeated player and AI turns without an unresolved loop", () => {
+  for (let seed = 1; seed <= 50; seed += 1) {
     let state = autoResolve(finishMulligan(createGame(seed % 2 === 0, seed), false));
     let actions = 0;
-    while (state.status === "playing" && state.globalTurn < 12 && actions < 120) {
+    while (state.status === "playing" && state.globalTurn < 20 && actions < 250) {
       state = autoResolve(state);
       if (state.turnSide !== "player" || state.phase !== "main") {
         actions += 1;
@@ -273,7 +395,7 @@ test("ten deterministic games advance through repeated player and AI turns witho
       else state = autoResolve(endTurn(state));
       actions += 1;
     }
-    assert.ok(actions < 120, `seed ${seed} entered an action loop`);
+    assert.ok(actions < 250, `seed ${seed} entered an action loop`);
     assert.equal(state.pending, undefined, `seed ${seed} left a pending choice`);
   }
 });
