@@ -23,6 +23,10 @@ npm install
 npm run dev
 ```
 
+dev 模式會把每一局的結構化事件（雙方出牌、進化、攻擊、AI 決策分數、血量變化）
+自動寫入 `match-logs/match-<gameId>.jsonl`，供事後分析。
+AI 強度基準測試：`npx tsx bench.ts 300`。AI 決策的分析與調整記錄見 `AI_NOTES.md`。
+
 完整測試與建置：
 
 ```bash

@@ -79,9 +79,23 @@ export type PendingChoice = {
   data?: Record<string, unknown>;
 };
 
+export type MatchEvent = {
+  seq: number;
+  turn: number;
+  ownTurn: number;
+  side: Side | "system";
+  type: string;
+  cardId?: string;
+  detail?: string;
+  hpPlayer: number;
+  hpAi: number;
+  pp?: number;
+};
+
 export type GameState = {
   version: 1;
   seed: number;
+  gameId: string;
   rng: number;
   uidCounter: number;
   status: "mulligan" | "playing" | "gameover";
@@ -98,6 +112,7 @@ export type GameState = {
   pending?: PendingChoice;
   log: string[];
   lastAction?: string;
+  events: MatchEvent[];
 };
 
 export type CardAction = {
@@ -184,6 +199,24 @@ function addLog(state: GameState, text: string): void {
   state.lastAction = text;
 }
 
+function addEvent(
+  state: GameState,
+  side: Side | "system",
+  type: string,
+  extra: { cardId?: string; detail?: string; pp?: number } = {},
+): void {
+  state.events.push({
+    seq: state.events.length,
+    turn: state.globalTurn,
+    ownTurn: side === "system" ? state.globalTurn : ps(state, side).ownTurn,
+    side,
+    type,
+    hpPlayer: state.player.hp,
+    hpAi: state.ai.hp,
+    ...extra,
+  });
+}
+
 function drawOne(state: GameState, side: Side): CardInstance | undefined {
   const player = ps(state, side);
   const top = player.deck.pop();
@@ -191,6 +224,7 @@ function drawOne(state: GameState, side: Side): CardInstance | undefined {
     state.status = "gameover";
     state.winner = otherSide(side);
     addLog(state, `${side === "player" ? "你" : "破壞巫"}無牌可抽，敗北。`);
+    addEvent(state, "system", "gameover", { detail: `winner=${state.winner} deckout=${side}` });
     return undefined;
   }
   top.zone = "hand";
@@ -310,6 +344,7 @@ function checkWinner(state: GameState): void {
     state.status = "gameover";
     state.winner = "player";
   }
+  if (state.status === "gameover") addEvent(state, "system", "gameover", { detail: `winner=${state.winner}` });
 }
 
 function healLeader(state: GameState, side: Side, amount: number): void {
@@ -499,6 +534,7 @@ export function createGame(playerFirst: boolean, seed = Date.now()): GameState {
   const state: GameState = {
     version: 1,
     seed: seed >>> 0,
+    gameId: `${(seed >>> 0).toString(36)}-${Date.now().toString(36)}`,
     rng: (seed || 0x9e3779b9) >>> 0,
     uidCounter: 0,
     status: "mulligan",
@@ -512,18 +548,26 @@ export function createGame(playerFirst: boolean, seed = Date.now()): GameState {
     evolvedThisTurn: false,
     tasks: [],
     log: [],
+    events: [],
   };
   createSide(state, "player", PLAYER_DECK, PLAYER_EVOLVE);
   createSide(state, "ai", AI_DECK, AI_EVOLVE);
   state.player.ep = playerFirst ? 0 : 3;
   state.ai.ep = playerFirst ? 3 : 0;
   addLog(state, `遊戲種子：${state.seed}。你選擇${playerFirst ? "先攻" : "後攻"}。`);
+  addEvent(state, "system", "gameStart", { detail: `seed=${state.seed} playerFirst=${playerFirst}` });
   return state;
 }
 
 function aiWantsMulligan(state: GameState): boolean {
   const hand = state.ai.hand.map((item) => item.cardId);
-  const hasEarly = hand.some((id) => CARDS[id].cost <= 2 && id !== "returningDissonance");
+  // 「低費」必須是能上場的東西（從者/護符）或能生蛋的殲滅の歌声；愉悦、章這種不算數，
+  // 否則會留下第1、2回合只能空過的起手。
+  const hasEarly = hand.some((id) => {
+    const def = CARDS[id];
+    if (id === "annihilationSong") return true;
+    return def.cost <= 2 && (def.kind === "follower" || def.kind === "amulet") && id !== "returningDissonance";
+  });
   const hasEngine = hand.some((id) => ["destructionWilderness", "manifestedLishenna", "dissonanceWorshipper", "annihilationSong"].includes(id));
   return !hasEarly || !hasEngine;
 }
@@ -548,10 +592,15 @@ export function finishMulligan(input: GameState, redraw: boolean): GameState {
   } else {
     addLog(state, "你保留起手。―");
   }
+  addEvent(state, "player", "mulligan", { detail: redraw ? "redraw" : "keep" });
   if (aiWantsMulligan(state)) {
     redrawHand(state, "ai");
     addLog(state, "破壞巫選擇重抽起手。―");
-  } else addLog(state, "破壞巫保留起手。―");
+    addEvent(state, "ai", "mulligan", { detail: "redraw" });
+  } else {
+    addLog(state, "破壞巫保留起手。―");
+    addEvent(state, "ai", "mulligan", { detail: "keep" });
+  }
   state.status = "playing";
   state.phase = "main";
   beginTurnMutable(state, state.turnSide);
@@ -585,6 +634,10 @@ function beginTurnMutable(state: GameState, side: Side): void {
   const isFirstPlayersFirstTurn = player.ownTurn === 1 && ((side === "player" && state.playerFirst) || (side === "ai" && !state.playerFirst));
   if (!isFirstPlayersFirstTurn) drawCards(state, side, 1);
   addLog(state, `${side === "player" ? "你的" : "破壞巫的"}第${player.ownTurn}回合開始（PP ${player.pp}/${player.maxPP}）。`);
+  addEvent(state, side, "turnStart", {
+    pp: player.pp,
+    detail: `hand=${player.hand.length} field=${player.field.length}${side === "ai" ? ` cards=${player.hand.map((item) => item.cardId).join(",")}` : ""}`,
+  });
   if (side === "ai") {
     for (const card of player.field) {
       if (card.cardId === "whiteArtifact") queue(state, { type: "heal", side: "ai", amount: 2 });
@@ -701,9 +754,16 @@ function aiTopSearchToHand(state: GameState, count: number, predicate: (card: Ca
   };
   const copiesAvailable = (cardId: string): number =>
     [...state.ai.hand, ...state.ai.field].filter((item) => baseCardId(item) === cardId).length;
+  // 快被沖死時優先撈解場牌，不撈長線價值牌。
+  const dangerBonus = (cardId: string): number => {
+    if (!aiInDanger(state)) return 0;
+    if (cardId === "destructionFanatic" || cardId === "destructionHermit" || cardId === "whiteBlackChapter" || cardId === "destructionServant") return 8;
+    if (cardId === "originalLishenna") return -6;
+    return 0;
+  };
   const picked = [...candidates].sort((a, b) => {
-    const aScore = (priority[a.cardId] ?? 5) - copiesAvailable(a.cardId) * 4;
-    const bScore = (priority[b.cardId] ?? 5) - copiesAvailable(b.cardId) * 4;
+    const aScore = (priority[a.cardId] ?? 5) - copiesAvailable(a.cardId) * 4 + dangerBonus(a.cardId);
+    const bScore = (priority[b.cardId] ?? 5) - copiesAvailable(b.cardId) * 4 + dangerBonus(b.cardId);
     return bScore - aScore;
   })[0];
   if (picked) {
@@ -1053,8 +1113,7 @@ function resolveTask(state: GameState, task: Task): void {
       if (sacrifice) {
         moveFieldToGrave(state, sacrifice, "アクシア進化費用");
         const choices = searchDeckInstances(state, side, (item) => isLishenna(item.cardId));
-        const priority: Record<string, number> = { originalLishenna: 12, destructiveLishenna: 11, manifestedLishenna: 10 };
-        const picked = choices.sort((a, b) => (priority[b.cardId] ?? 0) - (priority[a.cardId] ?? 0))[0];
+        const picked = choices.sort((a, b) => aiLishennaFetchPriority(state, b.cardId) - aiLishennaFetchPriority(state, a.cardId))[0];
         if (picked) {
           removeDeckInstance(state, side, picked.uid);
           picked.zone = "hand";
@@ -1117,7 +1176,7 @@ function removePlayedCard(state: GameState, side: Side, zone: Zone, uid: string)
   return removeFromZone(ps(state, side), zone, uid);
 }
 
-function playCardMutable(state: GameState, side: Side, uid: string, zone: Zone): boolean {
+function playCardMutable(state: GameState, side: Side, uid: string, zone: Zone, note?: string): boolean {
   const owned = findOwned(state, side, uid);
   if (!owned || owned.zone !== zone) return false;
   const reason = playableReason(state, owned.card, zone, side);
@@ -1137,6 +1196,7 @@ function playCardMutable(state: GameState, side: Side, uid: string, zone: Zone):
     putExistingIntoField(state, card, side, false);
   }
   addLog(state, `${side === "player" ? "你" : "破壞巫"}使用${cardName(card.cardId)}（支付${definition(card).cost}PP）。`);
+  addEvent(state, side, "play", { cardId: card.cardId, pp: ps(state, side).pp, detail: `cost=${definition(card).cost} zone=${zone}${note ? ` ${note}` : ""}` });
 
   const simultaneous: Task[] = [primary];
   if (side === "player" && (state.playedThisTurn === 3 || state.playedThisTurn === 5)) {
@@ -1224,8 +1284,7 @@ function resolveSpell(state: GameState, task: Task): void {
     if (cost) moveCardToBanished(state, "ai", cost, "grave");
     if (idolField(state).length >= 2 && canFitField(state, "ai")) {
       const choices = searchDeckInstances(state, "ai", (item) => isLishenna(item.cardId));
-      const priority: Record<string, number> = { originalLishenna: 12, destructiveLishenna: 11, manifestedLishenna: 10 };
-      const picked = choices.sort((a, b) => (priority[b.cardId] ?? 0) - (priority[a.cardId] ?? 0))[0];
+      const picked = choices.sort((a, b) => aiLishennaFetchPriority(state, b.cardId) - aiLishennaFetchPriority(state, a.cardId))[0];
       if (picked) {
         removeDeckInstance(state, "ai", picked.uid);
         putExistingIntoField(state, picked, "ai", true);
@@ -1236,7 +1295,10 @@ function resolveSpell(state: GameState, task: Task): void {
   }
   if (cardId === "solo" && target) {
     const needed = Math.min(idolField(state).filter((item) => !item.tapped).length, Math.ceil(remainingHealthOf(target) / 2));
-    const tappable = idolField(state).filter((item) => !item.tapped).slice(0, needed);
+    const tappable = idolField(state)
+      .filter((item) => !item.tapped)
+      .sort((a, b) => aiChapterTapPenalty(state, a) - aiChapterTapPenalty(state, b))
+      .slice(0, needed);
     for (const card of tappable) card.tapped = true;
     dealDamageToFollower(state, target, tappable.length * 2, "奏絶の独唱");
   }
@@ -1279,6 +1341,7 @@ function evolveMutable(state: GameState, side: Side, uid: string, payment: "pp" 
   }
   state.evolvedThisTurn = true;
   addLog(state, `${side === "player" ? "你" : "破壞巫"}使${cardName(card.baseCardId)}${superEvolve ? "超進化" : "進化"}。`);
+  addEvent(state, side, superEvolve ? "superEvolve" : "evolve", { cardId: card.baseCardId, pp: ps(state, side).pp, detail: `payment=${payment}` });
 
   const tasks: Task[] = [];
   if (evolveId === "naturalAriaEvo") tasks.push({ type: "spawn", side, cardId: "fairy", label: "自然の妖精姫・アリア的進化時" });
@@ -1344,6 +1407,10 @@ function resolveAttackMutable(state: GameState, attackerUid: string, targetUid: 
   if (!legal.includes(targetUid)) return;
   attacker.tapped = true;
   addLog(state, `${cardName(attacker.cardId)}宣告攻擊${targetUid === "ai-leader" ? "破壞巫主戰者" : "從者"}。`);
+  {
+    const targetCard = state.ai.field.find((item) => item.uid === targetUid);
+    addEvent(state, "player", "attack", { cardId: attacker.cardId, detail: `atk=${attackOf(attacker)} target=${targetUid === "ai-leader" ? "leader" : targetCard?.cardId ?? targetUid}` });
+  }
   aiQuickWindow(state, attacker);
   runTasks(state);
   if (!state.player.field.some((item) => item.uid === attackerUid) || state.status === "gameover") return;
@@ -1498,6 +1565,7 @@ export function activateFieldCard(input: GameState, uid: string, actionId: strin
     };
   } else if (actionId === "wonderDraw") {
     source.tapped = true;
+    addEvent(state, "player", "activate", { cardId: "wonderTree" });
     moveFieldToGrave(state, source, "ワンダーツリー起動費用");
     drawCards(state, "player", 2);
     addLog(state, "ワンダーツリー使你抽2張。 ");
@@ -1637,6 +1705,7 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
         if (target) target.tempStorm = true;
       }
       addLog(state, `フェアリーブレイダー・アマツ給${picked.length}體妖精疾走。`);
+      addEvent(state, "player", "activate", { cardId: "fairyBladeAmatsu", detail: `storm=${picked.length}` });
       break;
     }
     case "bouquetExCost": {
@@ -1661,6 +1730,7 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       const target = state.ai.field.find((item) => item.uid === picked[0]);
       if (source && target) {
         source.tapped = true;
+        addEvent(state, "player", "activate", { cardId: "bouquetFairy", detail: `bounce=${target.cardId}` });
         bounceFollower(state, target);
       }
       break;
@@ -1670,6 +1740,7 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       const target = state.ai.field.find((item) => item.uid === picked[0]);
       if (source && target) {
         source.tapped = true;
+        addEvent(state, "player", "activate", { cardId: "riotousGarden", detail: `target=${target.cardId}` });
         moveFieldToGrave(state, source, "繚乱の庭起動費用");
         const amount = fieldFairyTokens(state).length + state.player.ex.filter((item) => definition(item).token && isFairyCard(item.cardId) && isFollower(item)).length;
         dealDamageToFollower(state, target, amount, "繚乱の庭");
@@ -1682,6 +1753,7 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       if (source && target && state.player.pp >= 1 && exFairyCards(state).length === 5) {
         state.player.pp -= 1;
         source.tapped = true;
+        addEvent(state, "player", "activate", { cardId: "wingQueen", detail: `destroy=${target.cardId}` });
         moveFieldToGrave(state, source, "翅の女王・ティターニア起動費用");
         destroyFollower(state, target, "翅の女王・ティターニア");
         spawnToken(state, "ai", "fairy");
@@ -1723,12 +1795,17 @@ function aiQuickWindow(state: GameState, attacking?: CardInstance): void {
   if (!quick || !target || !state.player.field.some((item) => item.uid === target.uid)) return;
   const kills = remainingHealthOf(target) <= 2;
   const highThreat = attackOf(target) >= 4 || target.cardId === "queenCynthia" || target.cardId === "fairyBladeAmatsu";
-  if (!kills && !highThreat) return;
+  // 目標太廉價（低費衍生物、低攻）就不值得燒掉快速章與2PP。
+  const worthTarget = definition(baseCardId(target)).cost >= 2 || attackOf(target) >= 3;
+  if (!highThreat && !(kills && worthTarget)) return;
+  // 玩家已進斬殺圈時，章要留著當致命直傷，不做防守性交換——除非我方自己快被沖死。
+  if (!highThreat && state.player.hp <= 4 && idolField(state).length >= 2 && !aiInDanger(state)) return;
   removeFromZone(state.ai, "hand", quick.uid);
   quick.zone = "grave";
   state.ai.grave.push(quick);
   state.ai.pp -= 2;
   addLog(state, `破壞巫在快速時機使用${cardName(quick.cardId)}，目標為${cardName(target.cardId)}。`);
+  addEvent(state, "ai", "quick", { cardId: quick.cardId, pp: state.ai.pp, detail: `target=${target.cardId}` });
   dealDamageToFollower(state, target, 2, "白の章・黒の章（快速）");
   if (idolField(state).length >= 2) {
     damageLeader(state, "player", 2);
@@ -1804,7 +1881,7 @@ function aiCardValue(cardId: string): number {
 
 function aiQuickReserve(state: GameState): number {
   const hasQuick = state.ai.hand.some((item) => item.cardId === "whiteBlackChapter");
-  if (!hasQuick || state.ai.pp < 2 || state.ai.maxPP < 4) return 0;
+  if (!hasQuick || state.ai.pp < 2 || state.ai.maxPP < 3) return 0;
   const target = bestFollower(state, "player", "kill");
   if (!target) return 0;
   const kills = remainingHealthOf(target) <= 2;
@@ -1815,8 +1892,9 @@ function aiQuickReserve(state: GameState): number {
 function aiPlayScore(state: GameState, card: CardInstance, zone: Zone): number {
   const def = definition(card);
   if (playableReason(state, card, zone, "ai")) return -999;
-  if (def.evolveId && !aiCanCommitEvolveFollower(state, card)) return -999;
   let score = aiCardValue(card.cardId) - def.cost * 1.2;
+  // 進化目標湊不齊時降低優先度而不是完全卡手：寧可裸出2/2也不要浪費整回合PP。
+  if (def.evolveId && !aiCanCommitEvolveFollower(state, card)) score -= 16;
   const target = bestFollower(state, "player");
   const idols = idolField(state).length;
   const idolPermanentAfterPlay = isIdolCard(card.cardId) && (isFollower(card) || isAmulet(card)) ? idols + 1 : idols;
@@ -1833,19 +1911,34 @@ function aiPlayScore(state: GameState, card: CardInstance, zone: Zone): number {
   if (card.cardId === "manifestedLishenna") score += !eggField(state).length && canFitField(state, "ai") ? 22 : 16;
   if (card.cardId === "destructionWilderness" && idols < 3) score += 8;
   if (card.cardId === "dissonanceWorshipper" && state.ai.hand.length <= 5) score += 8;
-  if (card.cardId === "destructionHermit") score += idolPermanentAfterPlay >= 3 && target ? 24 : 0;
-  if (card.cardId === "destructionFanatic") score += idolPermanentAfterPlay >= 3 && target ? 42 : -24;
+  if (card.cardId === "destructionHermit") score += idolPermanentAfterPlay >= 3 && target ? 24 + (aiInDanger(state) ? 12 : 0) : 0;
+  if (card.cardId === "destructionFanatic") score += idolPermanentAfterPlay >= 3 && target ? 42 + (aiInDanger(state) ? 12 : 0) : -24;
+  // 従者主線：湊滿3偶像→入場免費進化→4/4身材＋2點解場＋2點打臉，是解妖精鋪場的核心。
+  if (card.cardId === "destructionServant") score += idolPermanentAfterPlay >= 3 && target ? 34 : 0;
+  // 絶傑リーシェナ：解場壓力小才值得拍4費白板；第二張（神器已上線）幾乎多餘。
+  if (card.cardId === "originalLishenna") {
+    const artifactsOnline = [...state.ai.ex, ...state.ai.field].some((item) => item.cardId === "whiteArtifact" || item.cardId === "blackArtifact")
+      || [...state.ai.field, ...state.ai.grave, ...state.ai.banished].some((item) => baseCardId(item) === "originalLishenna");
+    if (artifactsOnline) score -= 16;
+    if (aiInDanger(state)) score -= 24;
+    else if (playerBoardThreat(state) <= 4) score += 8;
+  }
+  if (card.cardId === "zelgenea" && aiInDanger(state)) score += 15;
   if (card.cardId === "destructiveLishenna") score += idolPermanentAfterPlay >= 3 && state.ai.ex.length < 5 ? 22 : 0;
   if (card.cardId === "whiteBlackChapter") {
     const bonusActive = idols >= 2;
     const lethal = bonusActive && state.player.hp <= 2;
-    if (!lethal) return -999;
-    score += 100;
+    const copies = state.ai.hand.filter((item) => item.cardId === "whiteBlackChapter").length;
+    const killsWorthTarget = target && remainingHealthOf(target) <= 2 && followerValue(state, target) >= 7;
+    if (lethal) score += 100;
+    else if (copies >= 2 && killsWorthTarget) score += 26;
+    else return -999;
   }
   if (card.cardId === "solo") {
     const standingIdols = idolField(state).filter((item) => !item.tapped).length;
     const kills = target && standingIdols * 2 >= remainingHealthOf(target);
-    const dangerous = target && (attackOf(target) >= 4 || target.cardId === "queenCynthia" || target.cardId === "fairyBladeAmatsu");
+    const dangerous = target && (attackOf(target) >= 4 || target.cardId === "queenCynthia" || target.cardId === "fairyBladeAmatsu"
+      || (aiInDanger(state) && attackOf(target) >= 2));
     score += target && (kills || dangerous) ? Math.min(42, standingIdols * 7) : -60;
   }
   if (card.cardId === "returningDissonance") score += idols >= 2 ? 15 : -50;
@@ -1918,16 +2011,20 @@ function tryAiEvolve(state: GameState): boolean {
   return false;
 }
 
-function aiUsePrayer(state: GameState): boolean {
+function aiUsePrayer(state: GameState, faceOnly = false): boolean {
   const source = state.ai.field.find((item) => item.cardId === "destructionPrayer" && !item.tapped);
   const sacrifice = aiSacrificeCandidate(state, source?.uid);
   if (!source || !sacrifice) return false;
   const target = bestFollower(state, "player", "kill");
-  const shouldUse = Boolean(target && remainingHealthOf(target) <= 2) || state.player.hp <= 6 || state.ai.field.length >= 5;
+  const racing = faceOnly || state.player.hp <= 8;
+  const killable = Boolean(target && remainingHealthOf(target) <= 2 && followerValue(state, target) >= 5);
+  const shouldUse = killable || racing || state.ai.field.length >= 5;
   if (!shouldUse) return false;
+  const hitFace = racing || !killable;
   source.tapped = true;
   moveFieldToGrave(state, sacrifice, "破壊の祈祷者起動費用");
-  if (target && remainingHealthOf(target) <= 2) dealDamageToFollower(state, target, 2, "破壊の祈祷者");
+  addEvent(state, "ai", "activate", { cardId: "destructionPrayer", detail: !hitFace && target ? `target=${target.cardId}` : "target=leader" });
+  if (!hitFace && target) dealDamageToFollower(state, target, 2, "破壊の祈祷者");
   else damageLeader(state, "player", 2);
   addLog(state, "破壞巫使用破壊の祈祷者的起動能力。 ");
   runTasks(state);
@@ -1951,6 +2048,7 @@ function aiChapterEffectValue(state: GameState, chapter: CardInstance): number {
   let value = chapter.cardId === "newBlack" ? 2 : state.ai.hp < 20 ? 1.5 : 0.5;
   const axiaReady = state.ai.field.some((item) => item.cardId === "axiaEvo" && !item.flags.axiaTriggered);
   if (axiaReady && state.player.field.some(isFollower)) value += 3;
+  if (chapter.cardId === "newBlack" && state.player.hp <= 8) value += 4;
   if (chapter.cardId === "newBlack" && state.player.hp <= 3) value += 20;
   if (chapter.cardId === "newWhite" && state.ai.hp <= 8) value += 10;
   return value;
@@ -1972,6 +2070,7 @@ function aiCycleChapter(state: GameState, preserveAttackers = true): boolean {
   if (preserveAttackers && lostAttack > aiChapterEffectValue(state, chapter)) return false;
   for (const card of costs) card.tapped = true;
   const payment = costs.map((card) => cardName(card.cardId)).join("、");
+  addEvent(state, "ai", "eggCycle", { cardId: chapter.cardId, detail: `taps=${payment}` });
   moveFieldToGrave(state, chapter, `${cardName(chapter.cardId)}起動費用`);
   addLog(state, `破壞巫橫置「${payment}」3張偶像卡牌，破壞${chapter.cardId === "newBlack" ? "黑蛋" : "白蛋"}以觸發謝幕曲。`);
   runTasks(state);
@@ -1982,6 +2081,7 @@ function aiUseWilderness(state: GameState): boolean {
   const wild = state.ai.field.find((item) => item.cardId === "destructionWilderness");
   const sacrifice = aiSacrificeCandidate(state, wild?.uid);
   if (!wild || !sacrifice || state.ai.field.length < 5) return false;
+  addEvent(state, "ai", "activate", { cardId: "destructionWilderness", detail: `sacrifice=${sacrifice.cardId}` });
   moveFieldToGrave(state, wild, "破壊の荒野起動費用");
   moveFieldToGrave(state, sacrifice, "破壊の荒野起動費用");
   addLog(state, "破壞巫起動破壊の荒野，清出場地空間。 ");
@@ -1999,6 +2099,7 @@ function aiGraveWorld(state: GameState): boolean {
   state.ai.evolveUsed.greatZelgenea = (state.ai.evolveUsed.greatZelgenea ?? 0) + 1;
   addExDirect(state, "ai", ["greatZelgenea"]);
   addLog(state, "破壞巫從墓場消滅《世界》・ゼルガネイア，將大いなる《世界》放入EX。 ");
+  addEvent(state, "ai", "activate", { cardId: "zelgenea", detail: "greatZelgenea→EX" });
   return true;
 }
 
@@ -2009,12 +2110,14 @@ function resolveAiAttack(state: GameState, attacker: CardInstance, targetUid: st
   attacker.tapped = true;
   if (targetUid === "player-leader") {
     addLog(state, `${cardName(attacker.cardId)}攻擊你的主戰者。`);
+    addEvent(state, "ai", "attack", { cardId: attacker.cardId, detail: `atk=${attackOf(attacker)} target=leader` });
     damageLeader(state, "player", attackOf(attacker));
     return;
   }
   const target = state.player.field.find((item) => item.uid === targetUid);
   if (!target) return;
   addLog(state, `${cardName(attacker.cardId)}攻擊${cardName(target.cardId)}。`);
+  addEvent(state, "ai", "attack", { cardId: attacker.cardId, detail: `atk=${attackOf(attacker)} target=${target.cardId} targetHp=${remainingHealthOf(target)}` });
   const attackerDamage = attackOf(target);
   const targetDamage = attackOf(attacker);
   dealDamageToFollower(state, target, targetDamage, "交戰");
@@ -2023,22 +2126,151 @@ function resolveAiAttack(state: GameState, attacker: CardInstance, targetUid: st
   runTasks(state);
 }
 
+function followerValue(state: GameState, card: CardInstance): number {
+  return attackOf(card) * 2 + remainingHealthOf(card)
+    + (hasKeyword(state, card, "ward") ? 4 : 0)
+    + (card.cardId === "queenCynthia" ? 8 : 0)
+    + (card.cardId === "fairyBladeAmatsu" ? 4 : 0);
+}
+
+function playerActWards(state: GameState): CardInstance[] {
+  return state.player.field.filter((item) => isFollower(item) && item.tapped && hasKeyword(state, item, "ward"));
+}
+
+// 玩家場面下回合能打出的臉傷估計（妖精配合シンシア/妖精郷幾乎全員能動）。
+function playerBoardThreat(state: GameState): number {
+  return state.player.field.filter(isFollower).reduce((total, item) => total + attackOf(item), 0);
+}
+
+// 解場壓力大：對面場面攻擊力已經逼近我方血量，再不解場就會被妖精沖死。
+function aiInDanger(state: GameState): boolean {
+  return playerBoardThreat(state) + 2 >= state.ai.hp;
+}
+
+// 撈リーシェナ的優先度：有壓力時要身材與解場（破壊→顕現→絶傑）；
+// 沒壓力才撈絶傑鋪神器，且神器已上線時第二張絶傑降到最低。
+function aiLishennaFetchPriority(state: GameState, cardId: string): number {
+  const pressured = aiInDanger(state) || playerBoardThreat(state) >= 6;
+  const priority: Record<string, number> = pressured
+    ? { destructiveLishenna: 12, manifestedLishenna: 11, originalLishenna: 10 }
+    : { originalLishenna: 12, destructiveLishenna: 11, manifestedLishenna: 10 };
+  let value = priority[cardId] ?? 0;
+  if (cardId === "originalLishenna") {
+    const artifactsOnline = [...state.ai.ex, ...state.ai.field].some((item) => item.cardId === "whiteArtifact" || item.cardId === "blackArtifact")
+      || [...state.ai.field, ...state.ai.grave, ...state.ai.banished].some((item) => baseCardId(item) === "originalLishenna");
+    if (artifactsOnline) value -= 8;
+  }
+  return value;
+}
+
+// 若本回合全力打臉，攻擊階段能對玩家主戰者造成多少傷害（先扣掉必須清除的橫置守護）。
+function aiAttackFaceDamage(state: GameState): number {
+  const attackers = state.ai.field.filter((item) => isFollower(item) && canAttackNow(state, item));
+  const faceCapable = attackers.filter((item) => item.enteredAt < state.globalTurn || hasKeyword(state, item, "storm"));
+  const wardOnly = attackers.filter((item) => !faceCapable.some((hit) => hit.uid === item.uid));
+  const wardBreakers = wardOnly.map(attackOf).sort((a, b) => b - a);
+  const facePool = faceCapable.map(attackOf).filter((atk) => atk > 0).sort((a, b) => a - b);
+  for (const ward of playerActWards(state)) {
+    let left = remainingHealthOf(ward);
+    while (left > 0) {
+      const hit = wardBreakers.shift() ?? facePool.shift();
+      if (hit === undefined) return 0;
+      left -= hit;
+    }
+  }
+  return facePool.reduce((total, atk) => total + atk, 0);
+}
+
+// 攻擊以外、本回合還能擠出的直傷（祈祷者、黑蛋循環、快速章、EX中的大世界）。
+// 注意不與 aiAttackFaceDamage 重複計算：能打臉的祈祷者只算攻擊那份。
+function aiBurnReach(state: GameState): number {
+  let reach = 0;
+  const prayers = state.ai.field.filter((item) =>
+    item.cardId === "destructionPrayer" && !item.tapped &&
+    !(canAttackNow(state, item) && item.enteredAt < state.globalTurn),
+  );
+  const spareSacrifices = idolField(state).filter((item) => item.cardId !== "destructionPrayer").length;
+  reach += Math.min(prayers.length, spareSacrifices) * 2;
+  // 蛋循環發生在攻擊之後：只數攻擊後仍會直立的偶像卡。
+  const idleIdols = idolField(state).filter((item) =>
+    !item.tapped && !(isFollower(item) && canAttackNow(state, item) && attackOf(item) > 0),
+  );
+  const blackEgg = state.ai.field.some((item) => item.cardId === "newBlack" && !item.tapped);
+  if (blackEgg && idleIdols.length >= 3) reach += 1;
+  if (
+    state.ai.hand.some((item) => item.cardId === "whiteBlackChapter") &&
+    state.ai.pp >= 2 &&
+    idolField(state).length >= 2 &&
+    state.player.field.some(isFollower)
+  ) reach += 2;
+  if (state.ai.ex.some((item) => item.cardId === "greatZelgenea")) reach += 4;
+  return reach;
+}
+
+function aiLethalInSight(state: GameState): boolean {
+  return aiAttackFaceDamage(state) + aiBurnReach(state) >= state.player.hp;
+}
+
 function aiAttackPhase(state: GameState): void {
   const attackers = state.ai.field.filter((item) => isFollower(item) && canAttackNow(state, item));
   attackers.sort((a, b) => attackOf(b) - attackOf(a));
   for (const attackerSnapshot of attackers) {
     const attacker = state.ai.field.find((item) => item.uid === attackerSnapshot.uid);
     if (!attacker || state.status !== "playing") continue;
+    if (attackOf(attacker) <= 0) continue;
     const targets = attackTargets(state, attacker);
     if (!targets.length) continue;
+    const face = targets.find((option) => option.uid === "player-leader");
     const followerTargets = targets
       .map((option) => state.player.field.find((item) => item.uid === option.uid))
       .filter(Boolean) as CardInstance[];
-    const favorable = followerTargets
+
+    // 斬殺在望或已進入收割節奏：全部打臉（守護會被 attackTargets 強制排進目標）。
+    const racing = aiLethalInSight(state) || state.player.hp <= 7;
+    if (racing && face) {
+      resolveAiAttack(state, attacker, face.uid);
+      continue;
+    }
+
+    const kills = followerTargets
       .filter((target) => attackOf(attacker) >= remainingHealthOf(target))
-      .sort((a, b) => attackOf(b) - attackOf(a))[0];
-    const face = targets.find((option) => option.uid === "player-leader");
-    resolveAiAttack(state, attacker, favorable?.uid ?? face?.uid ?? targets[0].uid);
+      .map((target) => {
+        const attackerDies = attackOf(target) >= remainingHealthOf(attacker);
+        return { target, net: followerValue(state, target) - (attackerDies ? followerValue(state, attacker) : 0) };
+      })
+      .sort((a, b) => b.net - a.net);
+    const bestKill = kills[0];
+
+    // 快被沖死時是保命交換：優先殺掉對面攻擊力最高的可擊殺目標，虧一點也要換；
+    // 殺不掉也要集火磨掉最大的威脅，而不是去打臉。
+    if (aiInDanger(state)) {
+      const defensiveKill = [...kills].sort((a, b) => attackOf(b.target) - attackOf(a.target))[0];
+      const chip = [...followerTargets].sort((a, b) => attackOf(b) - attackOf(a))[0];
+      const defensiveTarget = defensiveKill?.target ?? chip;
+      if (defensiveTarget) {
+        resolveAiAttack(state, attacker, defensiveTarget.uid);
+        continue;
+      }
+    }
+
+    // 非搶攻：挑「淨值最高的擊殺交換」，划不來就打臉，再不行才隨便選。
+    // 大身材不去換廉價衍生token——對面EX區免費補貨，虧的是自己的臉傷；小怪負責掃token。
+    if (bestKill && bestKill.net > 0) {
+      const targetDef = definition(baseCardId(bestKill.target));
+      const cheapToken = Boolean(targetDef.token) && attackOf(bestKill.target) <= 2;
+      const bigBody = attackOf(attacker) >= 3;
+      if (!(cheapToken && bigBody && face)) {
+        resolveAiAttack(state, attacker, bestKill.target.uid);
+        continue;
+      }
+    }
+    if (face) {
+      resolveAiAttack(state, attacker, face.uid);
+      continue;
+    }
+    // 沒有臉可打（守護擋路或本回合進場）：優先擊殺，否則集火剩餘體力最低的目標幫忙清場。
+    const fallback = bestKill?.target ?? followerTargets.sort((a, b) => remainingHealthOf(a) - remainingHealthOf(b))[0];
+    if (fallback) resolveAiAttack(state, attacker, fallback.uid);
   }
 }
 
@@ -2081,12 +2313,22 @@ function runAiTurnMutable(state: GameState): void {
     if (aiUsePrayer(state)) continue;
     if (aiUseWilderness(state)) continue;
     const best = aiBestPlayable(state);
-    if (best && playCardMutable(state, "ai", best.card.uid, best.zone)) {
+    if (best && playCardMutable(state, "ai", best.card.uid, best.zone, `score=${best.score.toFixed(1)}`)) {
       runTasks(state);
       continue;
     }
     if (aiCycleChapter(state, true)) continue;
     break;
+  }
+  // 斬殺執行：直傷加總足以擊殺時，把保留的快速章與祈祷者先灌臉，攻擊階段會自動全打臉。
+  if (state.status === "playing" && aiLethalInSight(state)) {
+    const chapter = state.ai.hand.find((item) => item.cardId === "whiteBlackChapter");
+    if (chapter && state.ai.pp >= 2 && idolField(state).length >= 2 && state.player.field.some(isFollower)) {
+      playCardMutable(state, "ai", chapter.uid, "hand", "lethal-reach");
+      runTasks(state);
+    }
+    let prayerGuard = 0;
+    while (state.status === "playing" && prayerGuard < 4 && aiUsePrayer(state, true)) prayerGuard += 1;
   }
   aiAttackPhase(state);
   while (state.status === "playing" && state.turnSide === "ai" && !state.pending && guard < 48) {
@@ -2135,4 +2377,10 @@ export const __testing = {
   tryAiEvolve,
   runAiTurnMutable,
   beginTurnMutable,
+  aiQuickWindow,
+  aiUsePrayer,
+  aiAttackPhase,
+  aiAttackFaceDamage,
+  aiBurnReach,
+  aiLethalInSight,
 };

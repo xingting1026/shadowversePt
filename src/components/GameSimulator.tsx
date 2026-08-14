@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { type Side } from "../game/cards";
 import {
   activateFieldCard,
@@ -360,6 +360,20 @@ export default function GameSimulator() {
   const [selected, setSelected] = useState<SelectedCard | null>(null);
   const [drawer, setDrawer] = useState<ZoneDrawer | null>(null);
   const [showLog, setShowLog] = useState(true);
+  const sentRef = useRef({ gameId: "", count: 0 });
+
+  useEffect(() => {
+    if (!state || !import.meta.env.DEV) return;
+    if (sentRef.current.gameId !== state.gameId) sentRef.current = { gameId: state.gameId, count: 0 };
+    const fresh = state.events.slice(sentRef.current.count);
+    if (!fresh.length) return;
+    sentRef.current.count = state.events.length;
+    void fetch("/__matchlog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gameId: state.gameId, lines: fresh }),
+    }).catch(() => {});
+  }, [state]);
 
   const turnLabel = useMemo(() => {
     if (!state) return "";

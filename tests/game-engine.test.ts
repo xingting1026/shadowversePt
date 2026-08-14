@@ -365,6 +365,137 @@ test("end phase offers every standing ward as an optional ACT choice", () => {
   assert.equal(ended.pending?.options.length, 1);
 });
 
+test("the destruction AI goes all-in on face when board attacks alone are lethal", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.hp = 5;
+  const fanatic = addField(state, "ai", "destructionFanatic");
+  const hermit = addField(state, "ai", "destructionHermit");
+  fanatic.enteredAt = state.globalTurn - 1;
+  hermit.enteredAt = state.globalTurn - 1;
+  // 場上放一隻可交換的目標（非守護）：舊AI會去換血，新AI必須直接打臉斬殺。
+  const bait = addField(state, "player", "breathFairyDancer");
+  bait.tapped = true;
+  __testing.aiAttackPhase(state);
+  assert.equal(state.status, "gameover");
+  assert.equal(state.winner, "ai");
+});
+
+test("the reserved Quick chapter is spent proactively when it completes lethal", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.phase = "ai";
+  state.player.field = [];
+  state.ai.field = [];
+  state.ai.hand = [];
+  state.player.hp = 4;
+  state.ai.pp = 2;
+  state.ai.maxPP = 4;
+  const hermit = addField(state, "ai", "destructionHermit");
+  const wilderness = addField(state, "ai", "destructionWilderness");
+  hermit.enteredAt = state.globalTurn - 1;
+  wilderness.enteredAt = state.globalTurn - 1;
+  addField(state, "player", "pureWaterFairy");
+  const quick = __testing.makeInstance(state, "whiteBlackChapter", "ai", "hand");
+  state.ai.hand = [quick];
+  // 章2點直傷＋隠者2點攻擊＝4，正好斬殺。
+  assert.equal(__testing.aiLethalInSight(state), true);
+  __testing.runAiTurnMutable(state);
+  assert.equal(state.status, "gameover");
+  assert.equal(state.winner, "ai");
+});
+
+test("the Quick window is not wasted on a cheap token attacker", () => {
+  const state = playing();
+  state.turnSide = "player";
+  state.player.field = [];
+  state.ai.field = [];
+  state.ai.pp = 4;
+  state.ai.maxPP = 4;
+  addField(state, "ai", "destructionHermit");
+  addField(state, "ai", "destructionWilderness");
+  const quick = __testing.makeInstance(state, "whiteBlackChapter", "ai", "hand");
+  state.ai.hand = [quick];
+  const token = addField(state, "player", "fairy");
+  __testing.aiQuickWindow(state, token);
+  assert.equal(state.ai.hand.length, 1, "chapter should stay in hand against a 1/1 token");
+  const amatsu = addField(state, "player", "fairyBladeAmatsu");
+  __testing.aiQuickWindow(state, amatsu);
+  assert.equal(state.ai.hand.length, 0, "chapter should still answer a real threat");
+});
+
+test("the prayer channels burn at the leader while racing", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.hp = 8;
+  addField(state, "ai", "destructionPrayer");
+  addField(state, "ai", "destructionHermit");
+  const kill = addField(state, "player", "pureWaterFairy");
+  kill.tapped = true;
+  assert.equal(__testing.aiUsePrayer(state), true);
+  assert.equal(state.player.hp, 6, "at 8hp the prayer must hit face, not the 2/1 follower");
+});
+
+test("Original Lishenna is a low-pressure play only, and a second copy is deprioritized", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  state.player.field = [];
+  state.ai.pp = 4;
+  state.ai.maxPP = 4;
+  const lishenna = __testing.makeInstance(state, "originalLishenna", "ai", "hand");
+  const calm = __testing.aiPlayScore(state, lishenna, "hand");
+  // 壓力大（對面場面攻擊力逼近血量）時大幅降分
+  state.ai.hp = 8;
+  const cynthia = addField(state, "player", "queenCynthia");
+  const dancer = addField(state, "player", "breathFairyDancer");
+  const pressured = __testing.aiPlayScore(state, lishenna, "hand");
+  assert.ok(pressured < calm - 20, `pressured score ${pressured} should be far below calm score ${calm}`);
+  // 神器已上線時的第二張也降分
+  state.player.field = state.player.field.filter((card) => card.uid !== cynthia.uid && card.uid !== dancer.uid);
+  state.ai.hp = 20;
+  __testing.addExDirect(state, "ai", ["whiteArtifact"]);
+  const secondCopy = __testing.aiPlayScore(state, lishenna, "hand");
+  assert.ok(secondCopy < calm, `second-copy score ${secondCopy} should be below first-copy score ${calm}`);
+});
+
+test("Destruction Servant is prioritized when three Idols enable its free evolve clear", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.ai.field = [];
+  state.ai.pp = 2;
+  state.ai.maxPP = 2;
+  addField(state, "player", "queenCynthia");
+  const servant = __testing.makeInstance(state, "destructionServant", "ai", "hand");
+  const without = __testing.aiPlayScore(state, servant, "hand");
+  addField(state, "ai", "newWhite");
+  addField(state, "ai", "destructionHermit");
+  const withCombo = __testing.aiPlayScore(state, servant, "hand");
+  assert.ok(withCombo > without + 25, `combo score ${withCombo} should far exceed off-combo score ${without}`);
+});
+
+test("under lethal pressure the AI trades into the biggest attacker instead of going face", () => {
+  const state = playing();
+  state.turnSide = "ai";
+  state.player.field = [];
+  state.ai.field = [];
+  state.ai.hp = 6;
+  state.player.hp = 20;
+  const cynthia = addField(state, "player", "queenCynthia");
+  cynthia.tapped = true;
+  const fanatic = addField(state, "ai", "destructionFanatic");
+  const lishenna = addField(state, "ai", "destructiveLishenna");
+  fanatic.enteredAt = state.globalTurn - 1;
+  lishenna.enteredAt = state.globalTurn - 1;
+  __testing.aiAttackPhase(state);
+  assert.equal(state.player.field.some((card) => card.uid === cynthia.uid), false, "Cynthia must be focused down, not ignored for face damage");
+  assert.equal(state.player.hp, 20);
+});
+
 function autoResolve(state: GameState): GameState {
   let current = state;
   let safety = 0;
