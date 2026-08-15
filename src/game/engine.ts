@@ -817,6 +817,103 @@ function removeDeckInstance(state: GameState, side: Side, uid: string): CardInst
   return removeFromZone(ps(state, side), "deck", uid);
 }
 
+function shuffleAfterSearch(state: GameState, side: Side, source: string): void {
+  shuffle(state, ps(state, side).deck);
+  addLog(state, `${source}檢索完成，${side === "player" ? "你" : "破壞巫"}洗牌。`);
+}
+
+function beginRunesAlbertSearch(state: GameState): void {
+  const candidates = searchDeckInstances(state, "player", (item) => isAlbert(item.cardId));
+  if (!candidates.length) {
+    addLog(state, "牌庫中已沒有符合條件的『アルベール』[ロイヤル]從者（可以檢索失敗）。");
+    shuffleAfterSearch(state, "player", "ルネス");
+    return;
+  }
+  state.pending = {
+    kind: "multi",
+    effect: "runesAlbertPick",
+    title: "レヴィオンの見習い・ルネス",
+    prompt: "可以從牌庫選擇1張名稱含『アルベール』的[ロイヤル]從者加入手牌；也可以不選。之後洗牌。",
+    options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+    min: 0,
+    max: 1,
+  };
+}
+
+function beginJusticeSaberSearch(state: GameState): void {
+  const candidates = searchDeckInstances(state, "player", (item) => cardName(item.cardId) === "レヴィオンセイバー・アルベール");
+  if (!candidates.length || !canFitField(state, "player")) {
+    addLog(state, !candidates.length ? "牌庫中沒有『レヴィオンセイバー・アルベール』，追加檢索落空。" : "場上已滿，可以讓レヴィオンセイバー・アルベール的追加檢索落空。");
+    shuffleAfterSearch(state, "player", "レヴィオンの正義（追加檢索）");
+    return;
+  }
+  state.pending = {
+    kind: "multi",
+    effect: "justiceSaberPick",
+    title: "レヴィオンの正義（追加檢索）",
+    prompt: "可以從牌庫選擇1張レヴィオンセイバー・アルベール放置到場上；也可以不選。之後洗牌。",
+    options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+    min: 0,
+    max: 1,
+  };
+}
+
+function finishJusticeDukeSearch(state: GameState, kicker: boolean, pickedUid?: string): void {
+  if (pickedUid && canFitField(state, "player")) {
+    const duke = removeDeckInstance(state, "player", pickedUid);
+    if (duke?.cardId === "levinDuke") {
+      putExistingIntoField(state, duke, "player", true);
+      addLog(state, "レヴィオンの正義將レヴィオンデューク・ユリウス放置到場上。");
+    }
+  } else if (pickedUid) {
+    addLog(state, "場上已滿，ユリウス沒有被找出。");
+  } else {
+    addLog(state, "你選擇讓ユリウス的檢索落空。");
+  }
+  shuffleAfterSearch(state, "player", "レヴィオンの正義");
+  if (kicker) beginJusticeSaberSearch(state);
+}
+
+function beginJusticeDukeSearch(state: GameState, kicker: boolean): void {
+  const candidates = searchDeckInstances(state, "player", (item) => item.cardId === "levinDuke");
+  if (!candidates.length || !canFitField(state, "player")) {
+    addLog(state, !candidates.length ? "牌庫中找不到レヴィオンデューク・ユリウス（可以檢索失敗）。" : "場上已滿，可以不找出ユリウス。");
+    shuffleAfterSearch(state, "player", "レヴィオンの正義");
+    if (kicker) beginJusticeSaberSearch(state);
+    return;
+  }
+  state.pending = {
+    kind: "multi",
+    effect: "justiceDukePick",
+    title: "レヴィオンの正義",
+    prompt: "可以從牌庫選擇1張レヴィオンデューク・ユリウス放置到場上；也可以不選。之後洗牌。",
+    options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+    min: 0,
+    max: 1,
+    data: { kicker },
+  };
+}
+
+function deploySistersSimultaneously(state: GameState, selectedUids: string[]): void {
+  const entering = selectedUids
+    .map((uid) => removeDeckInstance(state, "player", uid))
+    .filter(Boolean) as CardInstance[];
+  const entered: CardInstance[] = [];
+  for (const card of entering) {
+    if (putExistingIntoField(state, card, "player", false)) {
+      entered.push(card);
+      addLog(state, `レヴィオンシスターズ登場！將${cardName(card.cardId)}放置到場上。`);
+    }
+  }
+  const triggers: Task[] = entered.map((card) => {
+    const fanfare: Task = { type: "fanfare", side: "player", sourceUid: card.uid, cardId: card.cardId, label: `${cardName(card.cardId)}的入場曲` };
+    return hasKeyword(state, card, "ward")
+      ? { type: "wardOnEntry", side: "player", sourceUid: card.uid, data: { tasks: [fanfare] }, label: `${cardName(card.cardId)}的守護進場選擇` }
+      : fanfare;
+  });
+  if (triggers.length) setTriggerOrder(state, triggers);
+}
+
 function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined, cardId: string): void {
   switch (cardId) {
     case "naturalAria":
@@ -940,12 +1037,12 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
     }
     case "levinMaim": {
       const targets = state.ai.field.filter(isFollower);
-      if (!targets.length || graveLevin(state) < 5) break;
+      if (!targets.length) break;
       state.pending = {
         kind: "single",
         effect: "maimTarget",
         title: "レヴィオンの副団長・マイム",
-        prompt: "墓場雷維翁卡牌5張以上：選擇對方1體從者，對其造成3點傷害。",
+        prompt: "選擇對方1體從者。效果結算時若墓場雷維翁卡牌為5張以上，對其造成3點傷害。",
         options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
@@ -974,22 +1071,14 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
     case "levinTranscend": {
       const levinHand = state.player.hand.filter((item) => isLevinCard(item.cardId));
       if (levinHand.length < 2) break;
-      const revealed = levinHand.slice(0, 2);
-      addLog(state, `你公開手牌的${revealed.map((item) => cardName(item.cardId)).join("、")}。`);
-      const maxModes = graveLevin(state) >= 5 ? 3 : 1;
-      const hasTarget = state.ai.field.some(isFollower);
       state.pending = {
-        kind: "multi",
-        effect: "transcendModes",
+        kind: "yesNo",
+        effect: "transcendRevealChoice",
         title: "レヴィオンの超越者・ユリウス",
-        prompt: `選擇${maxModes === 3 ? "最多3項" : "1項"}效果。`,
-        options: [
-          { uid: "destroy", label: "①破壞對方場上1體從者", description: hasTarget ? undefined : "不符合：對方沒有從者" },
-          { uid: "burn", label: "②對對方主戰者造成3點傷害" },
-          { uid: "draw", label: "③抽2張牌，捨棄自己1張手牌" },
-        ],
+        prompt: "要公開手牌中2張雷維翁・卡牌，支付這個可選費用並發動效果嗎？",
+        options: [{ uid: "yes", label: "公開2張並發動" }, { uid: "no", label: "不公開、不發動" }],
         min: 1,
-        max: maxModes,
+        max: 1,
       };
       break;
     }
@@ -1155,6 +1244,89 @@ function resolveTask(state: GameState, task: Task): void {
     case "spell":
       resolveSpell(state, task);
       break;
+    case "aiAttackStep": {
+      const remaining = [...((task.data?.remaining as string[]) ?? [])];
+      const finish = Boolean(task.data?.finish);
+      let attacker: CardInstance | undefined;
+      let targetUid: string | undefined;
+      while (remaining.length && !attacker) {
+        const uid = remaining.shift() as string;
+        const candidate = state.ai.field.find((item) => item.uid === uid);
+        const chosenTarget = candidate ? chooseAiAttackTarget(state, candidate) : undefined;
+        if (candidate && chosenTarget) {
+          attacker = candidate;
+          targetUid = chosenTarget;
+        }
+      }
+      if (!attacker || !targetUid || !declareAiAttack(state, attacker, targetUid)) {
+        queueAiAttackContinuation(state, remaining, finish);
+        break;
+      }
+      queueFront(state, {
+        type: "aiAttackQuickWindow",
+        side: "player",
+        data: { attackerUid: attacker.uid, targetUid, remaining, finish },
+        label: `${cardName(attacker.cardId)}攻擊後的快速時機`,
+      });
+      break;
+    }
+    case "aiAttackQuickWindow": {
+      const attackerUid = task.data?.attackerUid as string;
+      const targetUid = task.data?.targetUid as string;
+      const remaining = (task.data?.remaining as string[]) ?? [];
+      const finish = Boolean(task.data?.finish);
+      const dukes = standingDukes(state);
+      const targets = state.ai.field.filter(isFollower);
+      if (!dukes.length || !targets.length || !state.ai.field.some((item) => item.uid === attackerUid)) {
+        resolveAiAttackCombat(state, attackerUid, targetUid);
+        queueAiAttackContinuation(state, remaining, finish);
+        break;
+      }
+      state.pending = {
+        kind: "single",
+        effect: "dukeQuickAttack",
+        title: "攻擊後的【快速】時機",
+        prompt: "可以起動1體直立的レヴィオンデューク・ユリウス；也可以略過，直接結算本次攻擊。",
+        options: [
+          ...dukes.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+          { uid: "pass", label: "不使用【快速】，結算攻擊" },
+        ],
+        min: 1,
+        max: 1,
+        data: { attackerUid, targetUid, remaining, finish },
+      };
+      break;
+    }
+    case "aiPostAttack": {
+      let guard = 0;
+      while (state.status === "playing" && state.turnSide === "ai" && !state.pending && guard < 8 && aiCycleChapter(state, false)) guard += 1;
+      if (state.status === "playing" && state.turnSide === "ai" && !state.pending) aiEndPhase(state);
+      break;
+    }
+    case "aiResumeMain":
+      if (state.status === "playing" && state.turnSide === "ai" && state.phase === "ai" && !state.pending) runAiTurnMutable(state);
+      break;
+    case "aiEndQuick": {
+      const dukes = standingDukes(state);
+      const targets = state.ai.field.filter(isFollower);
+      if (!dukes.length || !targets.length) {
+        finishAiEndPhase(state);
+        break;
+      }
+      state.pending = {
+        kind: "single",
+        effect: "dukeQuickEnd",
+        title: "對方結束階段的【快速】時機",
+        prompt: "可以起動1體直立的レヴィオンデューク・ユリウス；也可以略過並結束對方回合。",
+        options: [
+          ...dukes.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+          { uid: "pass", label: "不使用【快速】，結束對方回合" },
+        ],
+        min: 1,
+        max: 1,
+      };
+      break;
+    }
     case "addEx":
       addExTask(state, side, task.cardIds ?? [], (task.data?.after as Task[]) ?? []);
       break;
@@ -1285,12 +1457,16 @@ function resolveTask(state: GameState, task: Task): void {
     case "genoDig": {
       const top = state.player.deck[state.player.deck.length - 1];
       if (!top) break;
-      if (isLevinCard(top.cardId)) {
-        state.player.deck.pop();
-        top.zone = "hand";
-        state.player.hand.push(top);
-        addLog(state, `ジェノ的捨棄能力：公開牌庫頂的${cardName(top.cardId)}並加入手牌。`);
-      } else addLog(state, "ジェノ的捨棄能力：牌庫頂不是雷維翁・卡牌，放回原處。");
+      state.pending = {
+        kind: "multi",
+        effect: "genoDigPick",
+        title: "レヴィオンアックス・ジェノ",
+        prompt: "查看牌庫最上面1張牌。若是雷維翁・卡牌，可以公開並加入手牌；也可以不拿，讓它留在牌庫頂。",
+        options: [{ uid: top.uid, cardId: top.cardId, description: isLevinCard(top.cardId) ? undefined : "不是雷維翁・卡牌，不能加入手牌" }],
+        min: 0,
+        max: 1,
+        data: { topUid: top.uid },
+      };
       break;
     }
     case "runesSnipe": {
@@ -1394,12 +1570,12 @@ function playableReason(state: GameState, card: CardInstance, zone: Zone, side: 
     && state.player.field.some((item) => isLevinCard(baseCardId(item)) && isFollower(item) && definition(baseCardId(item)).cost <= 3);
   const requiredPp = canReduceBrutal ? Math.min(1, definition(card).cost) : definition(card).cost;
   if (ps(state, side).pp < requiredPp) return "PP不足";
-  if ((isFollower(card) || isAmulet(card)) && !canFitField(state, side)) return "場上5格已滿";
+  if ((isFollower(card) || isAmulet(card)) && !canFitField(state, side) && !canReduceBrutal) return "場上5格已滿";
   if (card.cardId === "tentacleBite") {
     if (!state.player.field.some((item) => isLevinCard(item.cardId) && isFollower(item) && !item.tapped)) return "需要1體可橫置的雷維翁・從者作為追加費用";
     if (!state.ai.field.some(isFollower)) return "對方場上沒有從者";
   }
-  if (card.cardId === "levinTranscend" && state.player.hand.filter((item) => item.uid !== card.uid && isLevinCard(item.cardId)).length < 2) return "手牌中雷維翁・卡牌不足2張（公開費用）";
+  if (card.cardId === "levinJustice" && !state.ai.field.some(isFollower)) return "對方場上沒有合法目標";
   if (zone === "ex" && card.cardId === "miasmaAria") return "這張アリア不能從EX區使用";
   if (card.cardId === "antiAir" && (!state.player.field.length || !state.ai.field.some(isFollower))) return "需要自己場上1張[エルフ]卡牌與對方1體從者";
   if (card.cardId === "returningDissonance") {
@@ -1520,7 +1696,7 @@ export function playCard(input: GameState, uid: string, zone: Zone): GameState {
       const sacrifices = state.player.field.filter((item) => isLevinCard(baseCardId(item)) && isFollower(item) && definition(baseCardId(item)).cost <= 3);
       if (sacrifices.length) {
         const options: ChoiceOption[] = sacrifices.map((item) => ({ uid: item.uid, cardId: item.cardId }));
-        if (state.player.pp >= 4) options.push({ uid: "full", label: "不犧牲，支付全額4PP" });
+        if (state.player.pp >= 4 && canFitField(state, "player")) options.push({ uid: "full", label: "不犧牲，支付全額4PP" });
         state.pending = {
           kind: "single",
           effect: "brutalGenoPlay",
@@ -1538,16 +1714,6 @@ export function playCard(input: GameState, uid: string, zone: Zone): GameState {
   playCardMutable(state, "player", uid, zone);
   runTasks(state);
   return state;
-}
-
-function resolveJusticeFetch(state: GameState, kicker: boolean): void {
-  const duke = searchDeckInstances(state, "player", (item) => item.cardId === "levinDuke")[0];
-  if (duke && canFitField(state, "player")) {
-    removeDeckInstance(state, "player", duke.uid);
-    putExistingIntoField(state, duke, "player", true);
-    addLog(state, "レヴィオンの正義將レヴィオンデューク・ユリウス放置到場上。");
-  } else addLog(state, duke ? "場上已滿，ユリウス無法進場。" : "牌庫中找不到レヴィオンデューク・ユリウス。");
-  if (kicker) addLog(state, "牌庫中沒有『レヴィオンセイバー・アルベール』（本牌組未收錄），追加檢索落空。");
 }
 
 function resolveSpell(state: GameState, task: Task): void {
@@ -1583,36 +1749,41 @@ function resolveSpell(state: GameState, task: Task): void {
   if (side === "player" && cardId === "levinSisters") {
     const names = ["levinMaim", "levinMiim", "levinMeim"];
     if (task.data?.kicker) {
-      for (const id of names) {
-        if (!canFitField(state, "player")) {
-          addLog(state, "場上已滿，其餘姊妹無法進場。");
-          break;
-        }
-        const found = searchDeckInstances(state, "player", (item) => item.cardId === id)[0];
-        if (!found) {
-          addLog(state, `牌庫中找不到${cardName(id)}。`);
-          continue;
-        }
-        removeDeckInstance(state, "player", found.uid);
-        putExistingIntoField(state, found, "player", true);
-        addLog(state, `レヴィオンシスターズ登場！將${cardName(id)}放置到場上。`);
+      const candidates = names
+        .map((id) => searchDeckInstances(state, "player", (item) => item.cardId === id)[0])
+        .filter(Boolean) as CardInstance[];
+      const capacity = Math.max(0, 5 - state.player.field.length);
+      if (!candidates.length || capacity === 0) {
+        addLog(state, !candidates.length ? "牌庫中找不到任何一位姊妹（可以檢索失敗）。" : "場上已滿，可以讓三姊妹的檢索全部落空。");
+        shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
+        return;
       }
+      state.pending = {
+        kind: "multi",
+        effect: "sistersDeploy",
+        title: "レヴィオンシスターズ登場！",
+        prompt: `可以選擇マイム、ミイム、メイム各最多1張同時放置到場上；也可以少選或不選。場上目前可放${capacity}張。之後洗牌。`,
+        options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: Math.min(3, capacity, candidates.length),
+      };
       return;
     }
     const candidates = names
       .map((id) => searchDeckInstances(state, "player", (item) => item.cardId === id)[0])
       .filter(Boolean) as CardInstance[];
     if (!candidates.length) {
-      addLog(state, "牌庫中找不到任何一位姊妹。");
+      addLog(state, "牌庫中找不到任何一位姊妹（可以檢索失敗）。");
+      shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
       return;
     }
     state.pending = {
-      kind: "single",
+      kind: "multi",
       effect: "sistersPick",
       title: "レヴィオンシスターズ登場！",
-      prompt: "選擇1張加入手牌。",
+      prompt: "可以選擇1張加入手牌；也可以不選。之後洗牌。",
       options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
-      min: 1,
+      min: 0,
       max: 1,
     };
     return;
@@ -1630,8 +1801,6 @@ function resolveSpell(state: GameState, task: Task): void {
         max: 1,
         data: { kicker: task.data?.kicker },
       };
-    } else {
-      resolveJusticeFetch(state, Boolean(task.data?.kicker));
     }
     return;
   }
@@ -1852,7 +2021,6 @@ function canActivate(state: GameState, card: CardInstance, actionId: string): st
   if (card.tapped) return "卡片已經橫置";
   if (actionId === "dukePing" && !state.ai.field.some(isFollower)) return "對方沒有從者";
   if (actionId === "archerSnipe") {
-    if (graveLevin(state) < 5) return "墓場雷維翁卡牌不足5張";
     if (!state.ai.field.some(isFollower)) return "對方沒有從者";
   }
   if (actionId === "amatsuStorm") {
@@ -1906,7 +2074,7 @@ export function cardActions(state: GameState, uid: string, zone: Zone, side: Sid
     wonderTree: ["wonderDraw", "橫置＋置入墓場：抽2張"],
     wingQueen: ["wingDestroy", "1PP＋橫置＋置入墓場：破壞敵方從者"],
     levinDuke: ["dukePing", "橫置：對敵方從者造成1點傷害"],
-    levinArcher: ["archerSnipe", "橫置：墓場雷維翁5+時，對敵方從者造成3點傷害"],
+    levinArcher: ["archerSnipe", "橫置：若墓場雷維翁5+，造成3點傷害"],
     levinAlbert: ["albertRestand", "3PP：使此卡直立（墓場ロイヤル從者10+，每回合1次）"],
   };
   const activation = actByCard[baseCardId(card)] ?? actByCard[card.cardId];
@@ -1981,7 +2149,7 @@ export function activateFieldCard(input: GameState, uid: string, actionId: strin
       kind: "single",
       effect: actionId === "dukePing" ? "dukeTarget" : "archerTarget",
       title: cardName(source.cardId),
-      prompt: actionId === "dukePing" ? "選擇要受到1點傷害的對方從者。" : "選擇要受到3點傷害的對方從者。",
+      prompt: actionId === "dukePing" ? "選擇要受到1點傷害的對方從者。" : "選擇對方1體從者。結算時若墓場雷維翁卡牌為5張以上，對其造成3點傷害；未達5張仍會橫置此卡。",
       options: state.ai.field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
       min: 1,
       max: 1,
@@ -2228,19 +2396,37 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
     case "runesDiscard": {
       if (!picked.length) break;
       if (discardPlayerCard(state, picked[0], "ルネス的入場曲")) {
-        const albert = searchDeckInstances(state, "player", (item) => isAlbert(item.cardId))[0];
-        if (albert) {
-          removeDeckInstance(state, "player", albert.uid);
-          albert.zone = "hand";
-          state.player.hand.push(albert);
-          addLog(state, `ルネス將${cardName(albert.cardId)}加入手牌。`);
-        } else addLog(state, "牌庫中已沒有アルベール。");
+        beginRunesAlbertSearch(state);
+      }
+      break;
+    }
+    case "runesAlbertPick": {
+      const card = picked.length ? removeDeckInstance(state, "player", picked[0]) : undefined;
+      if (card && isAlbert(card.cardId)) {
+        card.zone = "hand";
+        state.player.hand.push(card);
+        addLog(state, `ルネス將${cardName(card.cardId)}加入手牌。`);
+      } else addLog(state, "你選擇讓ルネス的檢索落空。");
+      shuffleAfterSearch(state, "player", "ルネス");
+      break;
+    }
+    case "genoDigPick": {
+      const top = state.player.deck[state.player.deck.length - 1];
+      const expectedUid = pending.data?.topUid as string | undefined;
+      if (picked.length && top?.uid === expectedUid && picked[0] === expectedUid && isLevinCard(top.cardId)) {
+        state.player.deck.pop();
+        top.zone = "hand";
+        state.player.hand.push(top);
+        addLog(state, `ジェノ的捨棄能力：公開牌庫頂的${cardName(top.cardId)}並加入手牌。`);
+      } else if (top?.uid === expectedUid) {
+        addLog(state, `ジェノ查看牌庫頂的${cardName(top.cardId)}後，讓它留在牌庫頂。`);
       }
       break;
     }
     case "maimTarget": {
       const target = state.ai.field.find((item) => item.uid === picked[0]);
-      if (target) dealDamageToFollower(state, target, 3, "レヴィオンの副団長・マイム");
+      if (target && graveLevin(state) >= 5) dealDamageToFollower(state, target, 3, "レヴィオンの副団長・マイム");
+      else if (target) addLog(state, "マイム的入場曲選定了目標，但墓場雷維翁・卡牌未達5張，因此沒有造成傷害。");
       break;
     }
     case "archerLevinPick": {
@@ -2257,6 +2443,45 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
         state.player.grave.push(rest);
       }
       if (cards.length) addLog(state, `其餘${cards.length}張置入墓場。`);
+      break;
+    }
+    case "transcendRevealChoice": {
+      if (picked[0] !== "yes") {
+        addLog(state, "你沒有支付超越者・ユリウス的公開費用，入場曲不發動。");
+        break;
+      }
+      const levinHand = state.player.hand.filter((item) => isLevinCard(item.cardId));
+      if (levinHand.length < 2) break;
+      state.pending = {
+        kind: "multi",
+        effect: "transcendRevealCards",
+        title: "レヴィオンの超越者・ユリウス",
+        prompt: "選擇正好2張手牌中的雷維翁・卡牌公開。",
+        options: levinHand.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 2,
+        max: 2,
+      };
+      break;
+    }
+    case "transcendRevealCards": {
+      const revealed = state.player.hand.filter((item) => picked.includes(item.uid) && isLevinCard(item.cardId));
+      if (revealed.length !== 2) break;
+      addLog(state, `你公開手牌的${revealed.map((item) => cardName(item.cardId)).join("、")}。`);
+      const maxModes = graveLevin(state) >= 5 ? 3 : 1;
+      const options: ChoiceOption[] = [
+        { uid: "burn", label: "②對對方主戰者造成3點傷害" },
+        { uid: "draw", label: "③抽2張牌，捨棄自己1張手牌" },
+      ];
+      if (state.ai.field.some(isFollower)) options.unshift({ uid: "destroy", label: "①破壞對方場上1體從者" });
+      state.pending = {
+        kind: "multi",
+        effect: "transcendModes",
+        title: "レヴィオンの超越者・ユリウス",
+        prompt: `選擇${maxModes === 3 ? "最多3項" : "1項"}效果。`,
+        options,
+        min: 1,
+        max: Math.min(maxModes, options.length),
+      };
       break;
     }
     case "transcendModes": {
@@ -2302,18 +2527,38 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       break;
     }
     case "sistersPick": {
-      const card = removeDeckInstance(state, "player", picked[0]);
+      const card = picked.length ? removeDeckInstance(state, "player", picked[0]) : undefined;
       if (card) {
         card.zone = "hand";
         state.player.hand.push(card);
         addLog(state, `レヴィオンシスターズ登場！將${cardName(card.cardId)}加入手牌。`);
-      }
+      } else addLog(state, "你選擇讓レヴィオンシスターズ登場！的檢索落空。");
+      shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
+      break;
+    }
+    case "sistersDeploy": {
+      deploySistersSimultaneously(state, picked);
+      if (!picked.length) addLog(state, "你選擇讓三姊妹的檢索全部落空。");
+      shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
       break;
     }
     case "justiceTarget": {
       const target = state.ai.field.find((item) => item.uid === picked[0]);
       if (target) dealDamageToFollower(state, target, 3, "レヴィオンの正義");
-      resolveJusticeFetch(state, Boolean(pending.data?.kicker));
+      beginJusticeDukeSearch(state, Boolean(pending.data?.kicker));
+      break;
+    }
+    case "justiceDukePick": {
+      finishJusticeDukeSearch(state, Boolean(pending.data?.kicker), picked[0]);
+      break;
+    }
+    case "justiceSaberPick": {
+      const card = picked.length ? removeDeckInstance(state, "player", picked[0]) : undefined;
+      if (card && canFitField(state, "player")) {
+        putExistingIntoField(state, card, "player", true);
+        addLog(state, "レヴィオンの正義將レヴィオンセイバー・アルベール放置到場上。");
+      } else addLog(state, "你選擇讓レヴィオンセイバー・アルベール的追加檢索落空。");
+      shuffleAfterSearch(state, "player", "レヴィオンの正義（追加檢索）");
       break;
     }
     case "runesSnipe": {
@@ -2356,16 +2601,109 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       const target = state.ai.field.find((item) => item.uid === picked[0]);
       if (source && target && !source.tapped) {
         source.tapped = true;
+        addEvent(state, "player", "activate", { cardId: "levinDuke", detail: `target=${target.cardId}` });
         dealDamageToFollower(state, target, 1, "レヴィオンデューク・ユリウス");
       }
+      break;
+    }
+    case "dukeQuickAttack": {
+      const attackerUid = pending.data?.attackerUid as string;
+      const targetUid = pending.data?.targetUid as string;
+      const remaining = (pending.data?.remaining as string[]) ?? [];
+      const finish = Boolean(pending.data?.finish);
+      if (picked[0] === "pass") {
+        resolveAiAttackCombat(state, attackerUid, targetUid);
+        queueAiAttackContinuation(state, remaining, finish);
+        break;
+      }
+      const duke = state.player.field.find((item) => item.uid === picked[0] && baseCardId(item) === "levinDuke" && !item.tapped);
+      if (!duke) {
+        resolveAiAttackCombat(state, attackerUid, targetUid);
+        queueAiAttackContinuation(state, remaining, finish);
+        break;
+      }
+      const targets = state.ai.field.filter(isFollower);
+      if (!targets.length) {
+        queueAiAttackContinuation(state, remaining, finish);
+        break;
+      }
+      state.pending = {
+        kind: "single",
+        effect: "dukeQuickAttackTarget",
+        title: `${cardName(duke.cardId)}【快速】`,
+        prompt: "選擇對方場上1體從者，對其造成1點傷害。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        data: { dukeUid: duke.uid, attackerUid, targetUid, remaining, finish },
+      };
+      break;
+    }
+    case "dukeQuickAttackTarget": {
+      const duke = state.player.field.find((item) => item.uid === pending.data?.dukeUid && baseCardId(item) === "levinDuke" && !item.tapped);
+      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const attackerUid = pending.data?.attackerUid as string;
+      const targetUid = pending.data?.targetUid as string;
+      const remaining = (pending.data?.remaining as string[]) ?? [];
+      const finish = Boolean(pending.data?.finish);
+      if (duke && target) {
+        duke.tapped = true;
+        addEvent(state, "player", "quick", { cardId: "levinDuke", detail: `attackWindow target=${target.cardId}` });
+        dealDamageToFollower(state, target, 1, "レヴィオンデューク・ユリウス【快速】");
+      }
+      if (state.ai.field.some((item) => item.uid === attackerUid)) {
+        queue(state, { type: "aiAttackQuickWindow", side: "player", data: { attackerUid, targetUid, remaining, finish } });
+      } else {
+        addLog(state, "攻擊從者被【快速】能力擊破，本次攻擊不造成傷害。");
+        queueAiAttackContinuation(state, remaining, finish);
+      }
+      break;
+    }
+    case "dukeQuickEnd": {
+      if (picked[0] === "pass") {
+        finishAiEndPhase(state);
+        break;
+      }
+      const duke = state.player.field.find((item) => item.uid === picked[0] && baseCardId(item) === "levinDuke" && !item.tapped);
+      if (!duke) {
+        finishAiEndPhase(state);
+        break;
+      }
+      const targets = state.ai.field.filter(isFollower);
+      if (!targets.length) {
+        finishAiEndPhase(state);
+        break;
+      }
+      state.pending = {
+        kind: "single",
+        effect: "dukeQuickEndTarget",
+        title: `${cardName(duke.cardId)}【快速】`,
+        prompt: "選擇對方場上1體從者，對其造成1點傷害。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        data: { dukeUid: duke.uid },
+      };
+      break;
+    }
+    case "dukeQuickEndTarget": {
+      const duke = state.player.field.find((item) => item.uid === pending.data?.dukeUid && baseCardId(item) === "levinDuke" && !item.tapped);
+      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      if (duke && target) {
+        duke.tapped = true;
+        addEvent(state, "player", "quick", { cardId: "levinDuke", detail: `endWindow target=${target.cardId}` });
+        dealDamageToFollower(state, target, 1, "レヴィオンデューク・ユリウス【快速】");
+      }
+      queue(state, { type: "aiEndQuick", side: "player" });
       break;
     }
     case "archerTarget": {
       const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
       const target = state.ai.field.find((item) => item.uid === picked[0]);
-      if (source && target && !source.tapped && graveLevin(state) >= 5) {
+      if (source && target && !source.tapped) {
         source.tapped = true;
-        dealDamageToFollower(state, target, 3, "レヴィオンの弓使い");
+        if (graveLevin(state) >= 5) dealDamageToFollower(state, target, 3, "レヴィオンの弓使い");
+        else addLog(state, "弓使い支付橫置費用，但墓場雷維翁・卡牌未達5張，因此沒有造成傷害。");
       }
       break;
     }
@@ -2712,27 +3050,43 @@ function aiGraveWorld(state: GameState): boolean {
   return true;
 }
 
-function resolveAiAttack(state: GameState, attacker: CardInstance, targetUid: string): void {
-  if (!canAttackNow(state, attacker)) return;
+function declareAiAttack(state: GameState, attacker: CardInstance, targetUid: string): boolean {
+  if (!canAttackNow(state, attacker)) return false;
   const legal = attackTargets(state, attacker).map((item) => item.uid);
-  if (!legal.includes(targetUid)) return;
+  if (!legal.includes(targetUid)) return false;
   attacker.tapped = true;
   if (targetUid === "player-leader") {
     addLog(state, `${cardName(attacker.cardId)}攻擊你的主戰者。`);
     addEvent(state, "ai", "attack", { cardId: attacker.cardId, detail: `atk=${attackOf(attacker)} target=leader` });
+    return true;
+  }
+  const target = state.player.field.find((item) => item.uid === targetUid);
+  if (!target) return false;
+  addLog(state, `${cardName(attacker.cardId)}攻擊${cardName(target.cardId)}。`);
+  addEvent(state, "ai", "attack", { cardId: attacker.cardId, detail: `atk=${attackOf(attacker)} target=${target.cardId} targetHp=${remainingHealthOf(target)}` });
+  return true;
+}
+
+function resolveAiAttackCombat(state: GameState, attackerUid: string, targetUid: string): void {
+  const attacker = state.ai.field.find((item) => item.uid === attackerUid);
+  if (!attacker) {
+    addLog(state, "攻擊從者在傷害結算前離場，本次攻擊不造成傷害。");
+    return;
+  }
+  if (targetUid === "player-leader") {
     damageLeader(state, "player", attackOf(attacker));
     return;
   }
   const target = state.player.field.find((item) => item.uid === targetUid);
-  if (!target) return;
-  addLog(state, `${cardName(attacker.cardId)}攻擊${cardName(target.cardId)}。`);
-  addEvent(state, "ai", "attack", { cardId: attacker.cardId, detail: `atk=${attackOf(attacker)} target=${target.cardId} targetHp=${remainingHealthOf(target)}` });
+  if (!target) {
+    addLog(state, "原攻擊目標在傷害結算前離場，本次攻擊不重新選擇目標。");
+    return;
+  }
   const attackerDamage = attackOf(target);
   const targetDamage = attackOf(attacker);
   dealDamageToFollower(state, target, targetDamage, "交戰");
   const still = state.ai.field.find((item) => item.uid === attacker.uid);
   if (still) dealDamageToFollower(state, still, attackerDamage, "交戰");
-  runTasks(state);
 }
 
 function followerValue(state: GameState, card: CardInstance): number {
@@ -2823,67 +3177,67 @@ function aiLethalInSight(state: GameState): boolean {
   return aiAttackFaceDamage(state) + aiBurnReach(state) >= state.player.hp;
 }
 
-function aiAttackPhase(state: GameState): void {
-  const attackers = state.ai.field.filter((item) => isFollower(item) && canAttackNow(state, item));
-  attackers.sort((a, b) => attackOf(b) - attackOf(a));
-  for (const attackerSnapshot of attackers) {
-    const attacker = state.ai.field.find((item) => item.uid === attackerSnapshot.uid);
-    if (!attacker || state.status !== "playing") continue;
-    if (attackOf(attacker) <= 0) continue;
-    const targets = attackTargets(state, attacker);
-    if (!targets.length) continue;
-    const face = targets.find((option) => option.uid === "player-leader");
-    const followerTargets = targets
-      .map((option) => state.player.field.find((item) => item.uid === option.uid))
-      .filter(Boolean) as CardInstance[];
+function chooseAiAttackTarget(state: GameState, attacker: CardInstance): string | undefined {
+  if (attackOf(attacker) <= 0) return undefined;
+  const targets = attackTargets(state, attacker);
+  if (!targets.length) return undefined;
+  const face = targets.find((option) => option.uid === "player-leader");
+  const followerTargets = targets
+    .map((option) => state.player.field.find((item) => item.uid === option.uid))
+    .filter(Boolean) as CardInstance[];
 
-    // 斬殺在望或已進入收割節奏：全部打臉（守護會被 attackTargets 強制排進目標）。
-    const racing = aiLethalInSight(state) || state.player.hp <= 7;
-    if (racing && face) {
-      resolveAiAttack(state, attacker, face.uid);
-      continue;
-    }
+  // 斬殺在望或已進入收割節奏：全部打臉（守護會被 attackTargets 強制排進目標）。
+  const racing = aiLethalInSight(state) || state.player.hp <= 7;
+  if (racing && face) return face.uid;
 
-    const kills = followerTargets
-      .filter((target) => attackOf(attacker) >= remainingHealthOf(target))
-      .map((target) => {
-        const attackerDies = attackOf(target) >= remainingHealthOf(attacker);
-        return { target, net: followerValue(state, target) - (attackerDies ? followerValue(state, attacker) : 0) };
-      })
-      .sort((a, b) => b.net - a.net);
-    const bestKill = kills[0];
+  const kills = followerTargets
+    .filter((target) => attackOf(attacker) >= remainingHealthOf(target))
+    .map((target) => {
+      const attackerDies = attackOf(target) >= remainingHealthOf(attacker);
+      return { target, net: followerValue(state, target) - (attackerDies ? followerValue(state, attacker) : 0) };
+    })
+    .sort((a, b) => b.net - a.net);
+  const bestKill = kills[0];
 
-    // 快被沖死時是保命交換：優先殺掉對面攻擊力最高的可擊殺目標，虧一點也要換；
-    // 殺不掉也要集火磨掉最大的威脅，而不是去打臉。
-    if (aiInDanger(state)) {
-      const defensiveKill = [...kills].sort((a, b) => attackOf(b.target) - attackOf(a.target))[0];
-      const chip = [...followerTargets].sort((a, b) => attackOf(b) - attackOf(a))[0];
-      const defensiveTarget = defensiveKill?.target ?? chip;
-      if (defensiveTarget) {
-        resolveAiAttack(state, attacker, defensiveTarget.uid);
-        continue;
-      }
-    }
-
-    // 非搶攻：挑「淨值最高的擊殺交換」，划不來就打臉，再不行才隨便選。
-    // 大身材不去換廉價衍生token——對面EX區免費補貨，虧的是自己的臉傷；小怪負責掃token。
-    if (bestKill && bestKill.net > 0) {
-      const targetDef = definition(baseCardId(bestKill.target));
-      const cheapToken = Boolean(targetDef.token) && attackOf(bestKill.target) <= 2;
-      const bigBody = attackOf(attacker) >= 3;
-      if (!(cheapToken && bigBody && face)) {
-        resolveAiAttack(state, attacker, bestKill.target.uid);
-        continue;
-      }
-    }
-    if (face) {
-      resolveAiAttack(state, attacker, face.uid);
-      continue;
-    }
-    // 沒有臉可打（守護擋路或本回合進場）：優先擊殺，否則集火剩餘體力最低的目標幫忙清場。
-    const fallback = bestKill?.target ?? followerTargets.sort((a, b) => remainingHealthOf(a) - remainingHealthOf(b))[0];
-    if (fallback) resolveAiAttack(state, attacker, fallback.uid);
+  if (aiInDanger(state)) {
+    const defensiveKill = [...kills].sort((a, b) => attackOf(b.target) - attackOf(a.target))[0];
+    const chip = [...followerTargets].sort((a, b) => attackOf(b) - attackOf(a))[0];
+    const defensiveTarget = defensiveKill?.target ?? chip;
+    if (defensiveTarget) return defensiveTarget.uid;
   }
+
+  if (bestKill && bestKill.net > 0) {
+    const targetDef = definition(baseCardId(bestKill.target));
+    const cheapToken = Boolean(targetDef.token) && attackOf(bestKill.target) <= 2;
+    const bigBody = attackOf(attacker) >= 3;
+    if (!(cheapToken && bigBody && face)) return bestKill.target.uid;
+  }
+  if (face) return face.uid;
+  const fallback = bestKill?.target ?? followerTargets.sort((a, b) => remainingHealthOf(a) - remainingHealthOf(b))[0];
+  return fallback?.uid;
+}
+
+function standingDukes(state: GameState): CardInstance[] {
+  return state.player.field.filter((item) => baseCardId(item) === "levinDuke" && isFollower(item) && !item.tapped);
+}
+
+function queueAiAttackContinuation(state: GameState, remaining: string[], finish: boolean): void {
+  if (state.status !== "playing" || state.turnSide !== "ai") return;
+  if (remaining.length) queue(state, { type: "aiAttackStep", side: "ai", data: { remaining, finish } });
+  else if (finish) queue(state, { type: "aiPostAttack", side: "ai" });
+}
+
+function beginAiAttackSequence(state: GameState, finish: boolean): void {
+  const remaining = state.ai.field
+    .filter((item) => isFollower(item) && canAttackNow(state, item))
+    .sort((a, b) => attackOf(b) - attackOf(a))
+    .map((item) => item.uid);
+  queueFront(state, { type: "aiAttackStep", side: "ai", data: { remaining, finish } });
+  runTasks(state);
+}
+
+function aiAttackPhase(state: GameState): void {
+  beginAiAttackSequence(state, false);
 }
 
 function aiDiscardToSeven(state: GameState): void {
@@ -2896,6 +3250,12 @@ function aiDiscardToSeven(state: GameState): void {
   }
 }
 
+function finishAiEndPhase(state: GameState): void {
+  if (state.status !== "playing" || state.turnSide !== "ai") return;
+  aiDiscardToSeven(state);
+  if (state.status === "playing") finishTurnSwitchMutable(state);
+}
+
 function aiEndPhase(state: GameState): void {
   state.phase = "end";
   const world = state.ai.ex.find((item) => item.cardId === "greatZelgenea");
@@ -2904,10 +3264,9 @@ function aiEndPhase(state: GameState): void {
     const taskCountBefore = state.tasks.length;
     for (const follower of [...state.player.field.filter(isFollower)]) dealDamageToFollower(state, follower, 4, "大いなる《世界》結束階段");
     groupNewPlayerTasks(state, taskCountBefore, "大いなる《世界》造成的同時離場效果");
-    runTasks(state);
   }
-  aiDiscardToSeven(state);
-  if (state.status === "playing") finishTurnSwitchMutable(state);
+  if (state.status === "playing") queue(state, { type: "aiEndQuick", side: "player", label: "對方結束階段的快速時機" });
+  runTasks(state);
 }
 
 function runAiTurnMutable(state: GameState): void {
@@ -2942,12 +3301,11 @@ function runAiTurnMutable(state: GameState): void {
     let prayerGuard = 0;
     while (state.status === "playing" && prayerGuard < 4 && aiUsePrayer(state, true)) prayerGuard += 1;
   }
-  aiAttackPhase(state);
-  while (state.status === "playing" && state.turnSide === "ai" && !state.pending && guard < 48) {
-    guard += 1;
-    if (!aiCycleChapter(state, false)) break;
+  if (state.status === "playing" && state.turnSide === "ai" && state.pending) {
+    if (!state.tasks.some((task) => task.type === "aiResumeMain")) queue(state, { type: "aiResumeMain", side: "ai" });
+    return;
   }
-  if (state.status === "playing") aiEndPhase(state);
+  if (state.status === "playing" && state.turnSide === "ai") beginAiAttackSequence(state, true);
 }
 
 function finishTurnSwitchMutable(state: GameState): void {
@@ -2992,6 +3350,7 @@ export const __testing = {
   aiQuickWindow,
   aiUsePrayer,
   aiAttackPhase,
+  aiEndPhase,
   aiAttackFaceDamage,
   aiBurnReach,
   aiLethalInSight,

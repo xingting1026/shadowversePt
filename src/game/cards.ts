@@ -410,7 +410,7 @@ export const CARDS: Record<string, CardDef> = {
     health: 4,
     traits: ["レヴィオン", "ロイヤル"],
     image: asset("BP02-027.jpg"),
-    text: "【快速】【起動】將此卡橫置：選擇對方場上1體從者，對其造成1點傷害。\n（模擬器簡化：僅能在自己的主階段起動。）",
+    text: "【快速】【起動】將此卡橫置：選擇對方場上1體從者，對其造成1點傷害。",
   }),
   levinMaim: card({
     id: "levinMaim",
@@ -493,7 +493,7 @@ export const CARDS: Record<string, CardDef> = {
     cost: 4,
     attack: 4,
     health: 3,
-    traits: ["ロイヤル"],
+    traits: ["レヴィオン", "ロイヤル"],
     image: asset("BP13-028.jpg"),
     text: "使用此卡時，可以將自己場上1體原本費用3以下的雷維翁・從者置入墓場：費用-3。\n【入場曲】選擇對方場上1體從者，對其造成4點傷害。",
   }),
