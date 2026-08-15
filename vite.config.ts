@@ -39,4 +39,7 @@ function matchLogger(): Plugin {
 export default defineConfig({
   base: "/shadowversePt/",
   plugins: [react(), matchLogger()],
+  server: {
+    watch: { ignored: ["**/match-logs/**"] },
+  },
 });

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { type Side } from "../game/cards";
+import { PLAYER_DECKS, type PlayerDeckId, type Side } from "../game/cards";
 import {
   activateFieldCard,
   attackOf,
@@ -106,7 +106,7 @@ function PlayerVitals({ state, side }: { state: GameState; side: Side }) {
     <div className={`vitals ${side === "ai" ? "vitals--ai" : "vitals--player"}`}>
       <div className="vitals__identity">
         <span className="vitals__eyebrow">{side === "ai" ? "規則型對手" : "玩家 · 7P9XP"}</span>
-        <strong>{side === "ai" ? "破壊ウィッチ" : "妖精エルフ"}</strong>
+        <strong>{side === "ai" ? "破壊ウィッチ" : PLAYER_DECKS[state.playerDeck].label}</strong>
       </div>
       <div className="vitals__stats">
         <StatPill tone={player.hp <= 7 ? "danger" : "good"}>HP {player.hp}</StatPill>
@@ -173,22 +173,41 @@ function HandBacks({ count }: { count: number }) {
   );
 }
 
-function SetupScreen({ onStart }: { onStart: (first: boolean, seed: number) => void }) {
+function SetupScreen({ onStart }: { onStart: (first: boolean, seed: number, deck: PlayerDeckId) => void }) {
   const [seed, setSeed] = useState(() => Math.floor(Date.now() % 2_147_483_647));
+  const [deck, setDeck] = useState<PlayerDeckId>("fairy");
   return (
     <main className="setup-shell">
       <section className="setup-card">
-        <div className="setup-card__mark">F / W</div>
+        <div className="setup-card__mark">{deck === "levin" ? "L / W" : "F / W"}</div>
         <p className="eyebrow">SHADOWVERSE EVOLVE · 對局研究室</p>
-        <h1>妖精 vs. 破壊</h1>
-        <p className="setup-card__lead">固定7P9XP妖精牌組，對戰52人賽冠軍5JK33破壞巫。你做每一個妖精決策，對手依局面評分自動採取最優規則行動。</p>
+        <h1>{deck === "levin" ? "雷維翁 vs. 破壊" : "妖精 vs. 破壊"}</h1>
+        <p className="setup-card__lead">
+          {deck === "levin"
+            ? "1KUUZE雷維翁皇家牌組：靠棄牌與磨牌把雷維翁堆進墓場，5張開啟全隊強化，アルベール一回合多段疾走收尾。對手是52人賽冠軍破壞巫。"
+            : "固定7P9XP妖精牌組，對戰52人賽冠軍5JK33破壞巫。你做每一個妖精決策，對手依局面評分自動採取最優規則行動。"}
+        </p>
+        <div className="setup-actions" role="radiogroup" aria-label="選擇牌組">
+          <button
+            type="button"
+            className={deck === "fairy" ? "primary-button" : "secondary-button"}
+            aria-pressed={deck === "fairy"}
+            onClick={() => setDeck("fairy")}
+          >妖精エルフ</button>
+          <button
+            type="button"
+            className={deck === "levin" ? "primary-button" : "secondary-button"}
+            aria-pressed={deck === "levin"}
+            onClick={() => setDeck("levin")}
+          >レヴィオンロイヤル</button>
+        </div>
         <label className="seed-field">
           <span>亂數種子</span>
           <input type="number" value={seed} onChange={(event) => setSeed(Number(event.target.value) || 1)} />
         </label>
         <div className="setup-actions">
-          <button type="button" className="primary-button" onClick={() => onStart(true, seed)}>我方先攻</button>
-          <button type="button" className="secondary-button" onClick={() => onStart(false, seed)}>我方後攻</button>
+          <button type="button" className="primary-button" onClick={() => onStart(true, seed, deck)}>我方先攻</button>
+          <button type="button" className="secondary-button" onClick={() => onStart(false, seed, deck)}>我方後攻</button>
         </div>
         <div className="setup-card__facts">
           <span>完整卡圖與效果詳情</span><span>重新整理即開始新對局</span><span>相同亂數種子可重播</span>
@@ -299,7 +318,7 @@ function CardDetail({ state, selection, onClose, setState }: { state: GameState;
   const perform = (id: string) => {
     let next = state;
     if (id === "play") next = playCard(state, card.uid, selection.zone);
-    else if (id === "attack" || ["amatsuStorm", "bouquetBounce", "gardenDamage", "wonderDraw", "wingDestroy"].includes(id)) next = activateFieldCard(state, card.uid, id);
+    else if (id === "attack" || ["amatsuStorm", "bouquetBounce", "gardenDamage", "wonderDraw", "wingDestroy", "dukePing", "archerSnipe", "albertRestand"].includes(id)) next = activateFieldCard(state, card.uid, id);
     else {
       const action = actions.find((item) => item.id === id);
       if (action?.payment) next = evolveCard(state, card.uid, action.payment, action.superEvolve);
@@ -381,15 +400,15 @@ export default function GameSimulator() {
     return state.turnSide === "player" ? `你的第${state.player.ownTurn}回合` : `破壞巫第${state.ai.ownTurn}回合`;
   }, [state]);
 
-  if (!state) return <SetupScreen onStart={(first, seed) => setState(createGame(first, seed))} />;
+  if (!state) return <SetupScreen onStart={(first, seed, deck) => setState(createGame(first, seed, deck))} />;
   if (state.status === "mulligan") return <><MulliganScreen state={state} onKeep={() => setState(finishMulligan(state, false))} onRedraw={() => setState(finishMulligan(state, true))} onInspect={setSelected} />{selected ? <CardDetail state={state} selection={selected} onClose={() => setSelected(null)} setState={setState} /> : null}</>;
 
   return (
     <main className="game-shell">
       <header className="game-header">
         <div>
-          <p className="eyebrow">妖精牌組 × 破壞巫</p>
-          <h1>妖精 vs. 破壊</h1>
+          <p className="eyebrow">{PLAYER_DECKS[state.playerDeck].label} × 破壞巫</p>
+          <h1>{state.playerDeck === "levin" ? "雷維翁 vs. 破壊" : "妖精 vs. 破壊"}</h1>
         </div>
         <div className="turn-status">
           <span className={`turn-dot ${state.turnSide === "player" ? "is-player" : "is-ai"}`} />

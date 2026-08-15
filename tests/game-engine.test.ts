@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   __testing,
+  activateFieldCard,
   attackTargets,
   cardActions,
   createGame,
   endTurn,
   finishMulligan,
+  hasKeyword,
   playCard,
   resolveChoice,
   type CardInstance,
@@ -494,6 +496,119 @@ test("under lethal pressure the AI trades into the biggest attacker instead of g
   __testing.aiAttackPhase(state);
   assert.equal(state.player.field.some((card) => card.uid === cynthia.uid), false, "Cynthia must be focused down, not ignored for face damage");
   assert.equal(state.player.hp, 20);
+});
+
+function levinPlaying(seed = 7): GameState {
+  return finishMulligan(createGame(true, seed, "levin"), false);
+}
+
+function fillGrave(state: GameState, cardId: string, count: number): void {
+  for (let index = 0; index < count; index += 1) {
+    state.player.grave.push(__testing.makeInstance(state, cardId, "player", "grave"));
+  }
+}
+
+test("the Levin graveyard engine turns on keywords at five Levin cards", () => {
+  const state = levinPlaying();
+  state.player.field = [];
+  state.player.grave = [];
+  const geno = addField(state, "player", "levinAxeGeno");
+  const meim = addField(state, "player", "levinMeim");
+  fillGrave(state, "levinMiim", 4);
+  assert.equal(hasKeyword(state, geno, "storm"), false);
+  assert.equal(hasKeyword(state, meim, "designated"), false);
+  fillGrave(state, "levinSisters", 1);
+  assert.equal(hasKeyword(state, geno, "storm"), true);
+  assert.equal(hasKeyword(state, meim, "designated"), true);
+});
+
+test("Levin Sisters with the +4 kicker summons all three sisters from the deck", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.pp = 5;
+  state.player.maxPP = 5;
+  const sisters = __testing.makeInstance(state, "levinSisters", "player", "hand");
+  state.player.hand = [sisters];
+  state = playCard(state, sisters.uid, "hand");
+  assert.equal(state.pending?.effect, "sistersKicker");
+  state = autoResolve(resolveChoice(state, ["yes"]));
+  for (const id of ["levinMaim", "levinMiim", "levinMeim"]) {
+    assert.equal(state.player.field.some((card) => card.cardId === id), true, `${id} should be on the field`);
+  }
+  assert.equal(state.player.pp, 0);
+});
+
+test("Brutal Geno can be played for one PP by sacrificing a cheap Levin follower", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.pp = 1;
+  state.player.maxPP = 4;
+  const runes = addField(state, "player", "levinRunes");
+  const geno = __testing.makeInstance(state, "brutalGeno", "player", "hand");
+  state.player.hand = [geno];
+  state = playCard(state, geno.uid, "hand");
+  assert.equal(state.pending?.effect, "brutalGenoPlay");
+  state = autoResolve(resolveChoice(state, [runes.uid]));
+  assert.equal(state.player.field.some((card) => card.cardId === "brutalGeno"), true);
+  assert.equal(state.player.grave.some((card) => card.uid === runes.uid), true);
+  assert.equal(state.player.pp, 0);
+});
+
+test("Albert restands for three PP once per turn with ten Royal followers in the graveyard", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.player.grave = [];
+  state.player.pp = 6;
+  const albert = addField(state, "player", "levinAlbert");
+  albert.tapped = true;
+  fillGrave(state, "gawain", 10);
+  state = activateFieldCard(state, albert.uid, "albertRestand");
+  const restood = state.player.field.find((card) => card.cardId === "levinAlbert");
+  assert.equal(restood?.tapped, false);
+  assert.equal(state.player.pp, 3);
+  restood!.tapped = true;
+  const again = activateFieldCard(state, restood!.uid, "albertRestand");
+  assert.equal(again.player.field.find((card) => card.cardId === "levinAlbert")?.tapped, true, "second restand in one turn must be rejected");
+});
+
+test("discarding Levin Axe Geno digs the deck top for a Levin card automatically", () => {
+  const state = levinPlaying();
+  state.player.field = [];
+  state.player.grave = [];
+  const miim = addField(state, "player", "levinMiim");
+  const geno = __testing.makeInstance(state, "levinAxeGeno", "player", "hand");
+  const topLevin = __testing.makeInstance(state, "levinMeim", "player", "deck");
+  state.player.hand = [geno];
+  state.player.deck.push(topLevin);
+  __testing.resolveTask(state, { type: "fanfare", side: "player", sourceUid: miim.uid, cardId: "levinMiim" });
+  assert.equal(state.pending?.effect, "miimDiscard");
+  const resolved = resolveChoice(state, [geno.uid]);
+  assert.equal(resolved.player.grave.some((card) => card.cardId === "levinAxeGeno"), true);
+  assert.equal(resolved.player.hand.some((card) => card.uid === topLevin.uid), true, "Geno's dig should add the Levin top card to hand");
+});
+
+test("fifty deterministic Levin games advance without an unresolved loop", () => {
+  for (let seed = 1; seed <= 50; seed += 1) {
+    let state = autoResolve(finishMulligan(createGame(seed % 2 === 0, seed, "levin"), false));
+    let actions = 0;
+    while (state.status === "playing" && state.globalTurn < 20 && actions < 250) {
+      state = autoResolve(state);
+      if (state.turnSide !== "player" || state.phase !== "main") {
+        actions += 1;
+        continue;
+      }
+      const playable = ([...state.player.hand.map((card) => ({ card, zone: "hand" as Zone })), ...state.player.ex.map((card) => ({ card, zone: "ex" as Zone }))])
+        .filter(({ card, zone }) => cardActions(state, card.uid, zone).some((action) => action.id === "play" && action.enabled))
+        .sort((a, b) => b.card.cardId.localeCompare(a.card.cardId))[0];
+      if (playable) state = autoResolve(playCard(state, playable.card.uid, playable.zone));
+      else state = autoResolve(endTurn(state));
+      actions += 1;
+    }
+    assert.ok(actions < 250, `seed ${seed} entered an action loop`);
+    assert.equal(state.pending, undefined, `seed ${seed} left a pending choice`);
+  }
 });
 
 function autoResolve(state: GameState): GameState {

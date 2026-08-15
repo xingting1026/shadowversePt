@@ -1,6 +1,6 @@
 /**
- * 無頭基準測試：腳本化妖精玩家 vs 破壞巫AI，量化AI強度。
- * 用法：npx tsx bench.ts [games]
+ * 無頭基準測試：腳本化玩家 vs 破壞巫AI，量化AI強度。
+ * 用法：npx tsx bench.ts [games] [fairy|levin]
  */
 import {
   attackTargets,
@@ -72,6 +72,7 @@ function playerTurn(input: GameState): GameState {
 }
 
 const games = Number(process.argv[2] ?? 300);
+const deck = (process.argv[3] === "levin" ? "levin" : "fairy") as "fairy" | "levin";
 let aiWins = 0;
 let playerWins = 0;
 let draws = 0;
@@ -81,7 +82,7 @@ let aiWinTurnSum = 0;
 let aiHpSum = 0;
 
 for (let seed = 1; seed <= games; seed += 1) {
-  let state = autoResolve(finishMulligan(createGame(seed % 2 === 0, seed), seed % 3 === 0));
+  let state = autoResolve(finishMulligan(createGame(seed % 2 === 0, seed, deck), seed % 3 === 0));
   let guard = 0;
   while (state.status === "playing" && guard < 200) {
     guard += 1;
@@ -97,6 +98,7 @@ for (let seed = 1; seed <= games; seed += 1) {
 
 console.log(JSON.stringify({
   games,
+  deck,
   aiWins,
   playerWins,
   draws,
