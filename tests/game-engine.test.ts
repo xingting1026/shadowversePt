@@ -15,6 +15,7 @@ import {
   type GameState,
   type Zone,
 } from "../src/game/engine.ts";
+import { isLevinCard } from "../src/game/cards.ts";
 
 function playing(seed = 7): GameState {
   return finishMulligan(createGame(true, seed), false);
@@ -522,6 +523,10 @@ test("the Levin graveyard engine turns on keywords at five Levin cards", () => {
   assert.equal(hasKeyword(state, meim, "designated"), true);
 });
 
+test("Brutal Geno is correctly tagged as a Levin card", () => {
+  assert.equal(isLevinCard("brutalGeno"), true);
+});
+
 test("Levin Sisters with the +4 kicker summons all three sisters from the deck", () => {
   let state = levinPlaying();
   state.player.field = [];
@@ -532,10 +537,14 @@ test("Levin Sisters with the +4 kicker summons all three sisters from the deck",
   state.player.hand = [sisters];
   state = playCard(state, sisters.uid, "hand");
   assert.equal(state.pending?.effect, "sistersKicker");
-  state = autoResolve(resolveChoice(state, ["yes"]));
+  state = resolveChoice(state, ["yes"]);
+  assert.equal(state.pending?.effect, "sistersDeploy");
+  state = resolveChoice(state, state.pending!.options.map((option) => option.uid));
+  assert.equal(state.pending?.effect, "triggerOrder", "all three Fanfare abilities should trigger simultaneously after every sister enters");
   for (const id of ["levinMaim", "levinMiim", "levinMeim"]) {
     assert.equal(state.player.field.some((card) => card.cardId === id), true, `${id} should be on the field`);
   }
+  state = autoResolve(state);
   assert.equal(state.player.pp, 0);
 });
 
@@ -573,20 +582,194 @@ test("Albert restands for three PP once per turn with ten Royal followers in the
   assert.equal(again.player.field.find((card) => card.cardId === "levinAlbert")?.tapped, true, "second restand in one turn must be rejected");
 });
 
-test("discarding Levin Axe Geno digs the deck top for a Levin card automatically", () => {
+test("discarding Levin Axe Geno shows the top card and lets the player take or leave it", () => {
   const state = levinPlaying();
   state.player.field = [];
   state.player.grave = [];
   const miim = addField(state, "player", "levinMiim");
   const geno = __testing.makeInstance(state, "levinAxeGeno", "player", "hand");
   const topLevin = __testing.makeInstance(state, "levinMeim", "player", "deck");
+  const miimDraw = __testing.makeInstance(state, "gawain", "player", "deck");
   state.player.hand = [geno];
-  state.player.deck.push(topLevin);
+  // ミイム先完成「抽1張」，之後才處理因捨棄而觸發的ジェノ能力。
+  state.player.deck.push(topLevin, miimDraw);
   __testing.resolveTask(state, { type: "fanfare", side: "player", sourceUid: miim.uid, cardId: "levinMiim" });
   assert.equal(state.pending?.effect, "miimDiscard");
-  const resolved = resolveChoice(state, [geno.uid]);
-  assert.equal(resolved.player.grave.some((card) => card.cardId === "levinAxeGeno"), true);
-  assert.equal(resolved.player.hand.some((card) => card.uid === topLevin.uid), true, "Geno's dig should add the Levin top card to hand");
+  const afterDiscard = resolveChoice(state, [geno.uid]);
+  assert.equal(afterDiscard.pending?.effect, "genoDigPick");
+  assert.equal(afterDiscard.player.grave.some((card) => card.cardId === "levinAxeGeno"), true);
+  assert.equal(afterDiscard.player.deck.at(-1)?.uid, topLevin.uid, "the top card must remain in the deck until the player decides");
+
+  const left = resolveChoice(afterDiscard, []);
+  assert.equal(left.player.deck.at(-1)?.uid, topLevin.uid);
+  assert.equal(left.player.hand.some((card) => card.uid === topLevin.uid), false);
+
+  const taken = resolveChoice(afterDiscard, [topLevin.uid]);
+  assert.equal(taken.player.hand.some((card) => card.uid === topLevin.uid), true);
+});
+
+test("Transcendent Julius is playable without two Levin cards and its reveal cost is optional", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.pp = 3;
+  const lone = __testing.makeInstance(state, "levinTranscend", "player", "hand");
+  state.player.hand = [lone];
+  assert.equal(cardActions(state, lone.uid, "hand").find((action) => action.id === "play")?.enabled, true);
+  const playedWithoutCost = playCard(state, lone.uid, "hand");
+  assert.equal(playedWithoutCost.player.field.some((card) => card.uid === lone.uid), true);
+  assert.equal(playedWithoutCost.pending, undefined);
+
+  state = levinPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.pp = 3;
+  const transcend = __testing.makeInstance(state, "levinTranscend", "player", "hand");
+  const miim = __testing.makeInstance(state, "levinMiim", "player", "hand");
+  const meim = __testing.makeInstance(state, "levinMeim", "player", "hand");
+  state.player.hand = [transcend, miim, meim];
+  state = playCard(state, transcend.uid, "hand");
+  assert.equal(state.pending?.effect, "transcendRevealChoice");
+  const declined = resolveChoice(state, ["no"]);
+  assert.equal(declined.pending, undefined);
+  assert.equal(declined.ai.hp, 20);
+
+  let accepted = resolveChoice(state, ["yes"]);
+  assert.equal(accepted.pending?.effect, "transcendRevealCards");
+  accepted = resolveChoice(accepted, [miim.uid, meim.uid]);
+  assert.equal(accepted.pending?.effect, "transcendModes");
+  accepted = resolveChoice(accepted, ["burn"]);
+  assert.equal(accepted.ai.hp, 17);
+});
+
+test("Runes asks which Albert to take and shuffles even when the search is declined", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.player.grave = [];
+  const runes = addField(state, "player", "levinRunes");
+  const discard = __testing.makeInstance(state, "levinMiim", "player", "hand");
+  const albert = __testing.makeInstance(state, "levinAlbert", "player", "deck");
+  const fillerA = __testing.makeInstance(state, "gawain", "player", "deck");
+  const fillerB = __testing.makeInstance(state, "levinMaim", "player", "deck");
+  state.player.hand = [discard];
+  state.player.deck = [albert, fillerA, fillerB];
+  __testing.resolveTask(state, { type: "fanfare", side: "player", sourceUid: runes.uid, cardId: "levinRunes" });
+  assert.equal(state.pending?.effect, "runesDiscard");
+  state = resolveChoice(state, [discard.uid]);
+  assert.equal(state.pending?.effect, "runesAlbertPick");
+  const rngBeforeSearch = state.rng;
+  state = resolveChoice(state, []);
+  assert.equal(state.player.deck.some((card) => card.uid === albert.uid), true);
+  assert.notEqual(state.rng, rngBeforeSearch);
+});
+
+test("Levin Justice requires a follower target and its Duke search can intentionally fail", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.pp = 5;
+  const noTargetJustice = __testing.makeInstance(state, "levinJustice", "player", "hand");
+  state.player.hand = [noTargetJustice];
+  const playAction = cardActions(state, noTargetJustice.uid, "hand").find((action) => action.id === "play");
+  assert.equal(playAction?.enabled, false);
+  const rejected = playCard(state, noTargetJustice.uid, "hand");
+  assert.equal(rejected.player.hand.some((card) => card.uid === noTargetJustice.uid), true);
+  assert.equal(rejected.player.pp, 5);
+
+  state = levinPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.pp = 3;
+  const justice = __testing.makeInstance(state, "levinJustice", "player", "hand");
+  const duke = __testing.makeInstance(state, "levinDuke", "player", "deck");
+  const fillerA = __testing.makeInstance(state, "gawain", "player", "deck");
+  const fillerB = __testing.makeInstance(state, "levinMiim", "player", "deck");
+  state.player.hand = [justice];
+  state.player.deck = [duke, fillerA, fillerB];
+  const target = addField(state, "ai", "destructionPrayer");
+  state = playCard(state, justice.uid, "hand");
+  state = resolveChoice(state, [target.uid]);
+  assert.equal(state.pending?.effect, "justiceDukePick");
+  const rngBeforeSearch = state.rng;
+  const skipped = resolveChoice(state, []);
+  assert.equal(skipped.player.field.some((card) => card.cardId === "levinDuke"), false);
+  assert.notEqual(skipped.rng, rngBeforeSearch, "the deck must be shuffled even when the legal search is declined");
+});
+
+test("Brutal Geno can sacrifice a cheap Levin follower even while all five field slots are occupied", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  state.player.pp = 1;
+  const sacrifice = addField(state, "player", "levinRunes");
+  for (let index = 0; index < 4; index += 1) addField(state, "player", "levinMiim");
+  const geno = __testing.makeInstance(state, "brutalGeno", "player", "hand");
+  state.player.hand = [geno];
+  assert.equal(cardActions(state, geno.uid, "hand").find((action) => action.id === "play")?.enabled, true);
+  state = playCard(state, geno.uid, "hand");
+  assert.equal(state.pending?.effect, "brutalGenoPlay");
+  state = autoResolve(resolveChoice(state, [sacrifice.uid]));
+  assert.equal(state.player.field.length, 5);
+  assert.equal(state.player.field.some((card) => card.cardId === "brutalGeno"), true);
+});
+
+test("Maim and the Levin Archer still choose a target and pay ACT below five Levin cards", () => {
+  let state = levinPlaying();
+  state.player.field = [];
+  state.player.grave = [];
+  state.ai.field = [];
+  const target = addField(state, "ai", "destructionPrayer");
+  const maim = addField(state, "player", "levinMaim");
+  __testing.resolveTask(state, { type: "fanfare", side: "player", sourceUid: maim.uid, cardId: "levinMaim" });
+  assert.equal(state.pending?.effect, "maimTarget");
+  state = resolveChoice(state, [target.uid]);
+  assert.equal(state.ai.field.find((card) => card.uid === target.uid)?.damage, 0);
+
+  const archer = addField(state, "player", "levinArcher");
+  const archerAction = cardActions(state, archer.uid, "field").find((action) => action.id === "archerSnipe");
+  assert.equal(archerAction?.enabled, true);
+  state = activateFieldCard(state, archer.uid, "archerSnipe");
+  state = resolveChoice(state, [target.uid]);
+  assert.equal(state.player.field.find((card) => card.uid === archer.uid)?.tapped, true);
+  assert.equal(state.ai.field.find((card) => card.uid === target.uid)?.damage, 0);
+});
+
+test("Duke can use Quick after an AI attack declaration to destroy the attacker", () => {
+  let state = levinPlaying();
+  state.turnSide = "ai";
+  state.phase = "ai";
+  state.player.field = [];
+  state.ai.field = [];
+  const duke = addField(state, "player", "levinDuke");
+  const attacker = addField(state, "ai", "destructionHermit");
+  attacker.enteredAt = state.globalTurn - 1;
+  attacker.damage = 1;
+  const hpBefore = state.player.hp;
+  __testing.aiAttackPhase(state);
+  assert.equal(state.pending?.effect, "dukeQuickAttack");
+  state = resolveChoice(state, [duke.uid]);
+  assert.equal(state.pending?.effect, "dukeQuickAttackTarget");
+  state = resolveChoice(state, [attacker.uid]);
+  assert.equal(state.ai.field.some((card) => card.uid === attacker.uid), false);
+  assert.equal(state.player.hp, hpBefore, "a destroyed attacker must not deal combat damage");
+});
+
+test("Duke receives a Quick window during the AI end phase", () => {
+  let state = levinPlaying();
+  state.turnSide = "ai";
+  state.phase = "ai";
+  state.player.field = [];
+  state.ai.field = [];
+  const duke = addField(state, "player", "levinDuke");
+  const target = addField(state, "ai", "destructionHermit");
+  target.damage = 1;
+  __testing.aiEndPhase(state);
+  assert.equal(state.pending?.effect, "dukeQuickEnd");
+  state = resolveChoice(state, [duke.uid]);
+  assert.equal(state.pending?.effect, "dukeQuickEndTarget");
+  state = resolveChoice(state, [target.uid]);
+  assert.equal(state.ai.field.some((card) => card.uid === target.uid), false);
+  assert.equal(state.turnSide, "player");
 });
 
 test("fifty deterministic Levin games advance without an unresolved loop", () => {
