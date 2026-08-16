@@ -2,6 +2,7 @@ import {
   TRAINING_ENCODING_METADATA,
   encodeTrainingAction,
   encodeTrainingState,
+  type TrainingEncodingMetadata,
 } from "./training-encoding";
 import type { GameState } from "./engine";
 import type { TrainingAction } from "./training";
@@ -50,15 +51,26 @@ function pad(values: number[], size: number): number[] {
   return result;
 }
 
-/** Reproduces training/model.py:tensorize exactly for a single live decision. */
-export function buildBrowserPolicyInputs(state: GameState, actions: TrainingAction[]): BrowserPolicyInputs {
+/**
+ * Reproduces training/model.py:tensorize exactly for a single live decision.
+ *
+ * `metadata` 預設為目前的編碼中繼資料；載入舊 manifest 的模型時應傳入該
+ * manifest 的 metadata——tensor 維度以它為準，超出舊字典的卡索引映射到
+ * 0（unknown），zone counts 超出舊字典的部分直接捨棄。
+ */
+export function buildBrowserPolicyInputs(
+  state: GameState,
+  actions: TrainingAction[],
+  metadata: TrainingEncodingMetadata = TRAINING_ENCODING_METADATA,
+): BrowserPolicyInputs {
   if (!actions.length) throw new Error("模型推論需要至少一個合法動作");
-  const metadata = TRAINING_ENCODING_METADATA;
   const encodedState = encodeTrainingState(state, "ai");
   const encodedActions = actions.map((action) => encodeTrainingAction(state, action));
   if (encodedState.scalars.length !== metadata.scalarSize) {
     throw new Error(`狀態編碼長度不符：${encodedState.scalars.length}/${metadata.scalarSize}`);
   }
+  // 舊模型不認得新卡：索引超出其字典時視為 0（unknown embedding）。
+  const clampCard = (index: number): number => (index >= 0 && index < metadata.cardVocabularySize ? index : 0);
 
   const zoneCounts = new Array<number>(metadata.zoneNames.length * metadata.cardVocabularySize).fill(0);
   encodedState.zones.forEach((cards, zoneIndex) => {
@@ -72,7 +84,7 @@ export function buildBrowserPolicyInputs(state: GameState, actions: TrainingActi
   const fieldCards = new Array<number>(metadata.fieldSlots).fill(0);
   const fieldNumbers = new Array<number>(metadata.fieldSlots * metadata.fieldNumberSize).fill(0);
   encodedState.field.slice(0, metadata.fieldSlots).forEach((card, slot) => {
-    fieldCards[slot] = card.card;
+    fieldCards[slot] = clampCard(card.card);
     fieldNumbers.splice(slot * metadata.fieldNumberSize, metadata.fieldNumberSize, ...pad(card.numbers, metadata.fieldNumberSize));
   });
 
@@ -82,12 +94,12 @@ export function buildBrowserPolicyInputs(state: GameState, actions: TrainingActi
   const eventStart = metadata.recentEventSlots - recentEvents.length;
   recentEvents.forEach((event, offset) => {
     const slot = eventStart + offset;
-    eventCards[slot] = event.card;
+    eventCards[slot] = clampCard(event.card);
     eventNumbers.splice(slot * metadata.recentEventNumberSize, metadata.recentEventNumberSize, ...pad(event.numbers, metadata.recentEventNumberSize));
   });
 
   const actionCount = encodedActions.length;
-  const selectedCards = encodedActions.flatMap((action) => pad(action.selectedCards, metadata.actionSelectionSlots));
+  const selectedCards = encodedActions.flatMap((action) => pad(action.selectedCards.map(clampCard), metadata.actionSelectionSlots));
   const selectedSpecials = encodedActions.flatMap((action) => pad(action.selectedSpecials, metadata.actionSelectionSlots));
   const actionNumbers = encodedActions.flatMap((action) => pad(action.numbers, metadata.actionNumberSize));
 
@@ -99,7 +111,7 @@ export function buildBrowserPolicyInputs(state: GameState, actions: TrainingActi
     event_cards: integers(eventCards, [1, metadata.recentEventSlots]),
     event_numbers: floats(eventNumbers, [1, metadata.recentEventSlots, metadata.recentEventNumberSize]),
     kinds: integers(encodedActions.map((action) => action.kind), [1, actionCount]),
-    cards: integers(encodedActions.map((action) => action.card), [1, actionCount]),
+    cards: integers(encodedActions.map((action) => clampCard(action.card)), [1, actionCount]),
     abilities: integers(encodedActions.map((action) => action.ability), [1, actionCount]),
     zones: integers(encodedActions.map((action) => action.zone), [1, actionCount]),
     selected_cards: integers(selectedCards, [1, actionCount, metadata.actionSelectionSlots]),

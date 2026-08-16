@@ -1,6 +1,6 @@
 /** Persistent JSON-lines bridge between the TypeScript rules engine and PyTorch. */
 import { createInterface } from "node:readline";
-import { createGame, type GameState } from "./src/game/engine.ts";
+import { createGame, type AiDeckId, type GameState } from "./src/game/engine.ts";
 import {
   applyTrainingAction,
   createTrainingReplay,
@@ -30,6 +30,8 @@ type InitRequest = {
   cmd: "init";
   envs: number;
   deck: PlayerDeckId;
+  /** ai 槽牌組；預設 "destruction"。非 destruction 時必須 selfPlay=true。 */
+  aiDeck?: AiDeckId;
   baseSeed?: number;
   record?: boolean;
   fixedFirst?: boolean;
@@ -59,6 +61,7 @@ type EnvironmentSlot = {
 
 let slots: EnvironmentSlot[] = [];
 let deck: PlayerDeckId = "fairy";
+let aiDeck: AiDeckId = "destruction";
 let baseSeed = 1;
 let record = false;
 let fixedFirst: boolean | undefined;
@@ -71,7 +74,7 @@ function seedFor(id: number, episode: number): number {
 function createSlot(id: number, episode: number): EnvironmentSlot {
   const seed = seedFor(id, episode);
   const playerFirst = fixedFirst ?? (seed % 2 === 0);
-  const state = createGame(playerFirst, seed, deck, { aiControl: selfPlay ? "manual" : "scripted" });
+  const state = createGame(playerFirst, seed, deck, { aiControl: selfPlay ? "manual" : "scripted", aiDeck });
   return {
     id,
     episode,
@@ -158,7 +161,11 @@ function auditFor(slot: EnvironmentSlot, input: AuditInput | undefined): Trainin
 
 function initialize(request: InitRequest) {
   if (!Number.isInteger(request.envs) || request.envs < 1 || request.envs > 256) throw new Error("envs must be between 1 and 256");
+  if ((request.aiDeck ?? "destruction") !== "destruction" && !request.selfPlay) {
+    throw new Error(`aiDeck "${request.aiDeck}" requires selfPlay=true: the scripted rules AI only plays the Destruction deck`);
+  }
   deck = request.deck;
+  aiDeck = request.aiDeck ?? "destruction";
   baseSeed = (request.baseSeed ?? 1) >>> 0;
   record = Boolean(request.record);
   fixedFirst = request.fixedFirst;
@@ -170,6 +177,7 @@ function initialize(request: InitRequest) {
     metadata: TRAINING_ENCODING_METADATA,
     engineVersion: slots[0].state.version,
     deck,
+    aiDeck,
     selfPlay,
     observations: slots.map(observation),
   };

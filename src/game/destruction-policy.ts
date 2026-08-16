@@ -1,5 +1,5 @@
 import * as ort from "onnxruntime-web/wasm";
-import { TRAINING_CARD_IDS, TRAINING_ENCODING_METADATA } from "./training-encoding";
+import { TRAINING_CARD_IDS, TRAINING_ENCODING_METADATA, TRAINING_ZONE_NAMES, type TrainingEncodingMetadata } from "./training-encoding";
 import { buildBrowserPolicyInputs } from "./browser-policy-input";
 import { GAME_ENGINE_VERSION, type GameState } from "./engine";
 import { trainingActor, trainingLegalActions, type TrainingAction } from "./training";
@@ -45,14 +45,16 @@ export type DestructionPolicy = {
 const MANIFEST_PATH = "models/destruction-cycle13.json";
 let policyPromise: Promise<DestructionPolicy> | undefined;
 
-function sameArray(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index]);
+function isPrefixOf(prefix: readonly string[], full: readonly string[]): boolean {
+  return prefix.length <= full.length && prefix.every((value, index) => value === full[index]);
 }
 
 function assertManifest(manifest: PolicyManifest): void {
   const metadata = TRAINING_ENCODING_METADATA;
+  // 卡牌字典允許之後擴充（凍結前綴＋追加）：manifest.cardIds 只需是現行
+  // TRAINING_CARD_IDS 的前綴，舊卡索引即與模型訓練時一致；vocabulary
+  // 相關維度改以 manifest 為準，其餘編碼欄位仍必須完全一致。
   const expected = {
-    cardVocabularySize: metadata.cardVocabularySize,
     zoneCount: metadata.zoneNames.length,
     scalarSize: metadata.scalarSize,
     fieldSlots: metadata.fieldSlots,
@@ -73,10 +75,31 @@ function assertManifest(manifest: PolicyManifest): void {
   if (manifest.engineVersion !== GAME_ENGINE_VERSION) {
     throw new Error(`模型只支援引擎 v${manifest.engineVersion}，目前是 v${GAME_ENGINE_VERSION}`);
   }
-  if (!sameArray(manifest.cardIds, TRAINING_CARD_IDS)) throw new Error("模型卡牌字典與網頁不一致");
+  if (!isPrefixOf(manifest.cardIds, TRAINING_CARD_IDS)) throw new Error("模型卡牌字典不是現行字典的前綴，舊卡索引已不一致");
+  if (manifest.metadata.cardVocabularySize !== manifest.cardIds.length + 1) {
+    throw new Error("模型 manifest 的 cardVocabularySize 與其 cardIds 不一致");
+  }
   for (const [key, value] of Object.entries(expected)) {
     if (manifest.metadata[key as keyof typeof expected] !== value) throw new Error(`模型編碼欄位不一致：${key}`);
   }
+}
+
+/** 舊模型的 tensor 維度以其 manifest 為準（cardVocabularySize 可能比現行字典小）。 */
+function manifestMetadata(manifest: PolicyManifest): TrainingEncodingMetadata {
+  return {
+    cardIds: manifest.cardIds,
+    cardVocabularySize: manifest.metadata.cardVocabularySize,
+    zoneNames: TRAINING_ZONE_NAMES,
+    scalarSize: manifest.metadata.scalarSize,
+    fieldSlots: manifest.metadata.fieldSlots,
+    fieldNumberSize: manifest.metadata.fieldNumberSize,
+    recentEventSlots: manifest.metadata.recentEventSlots,
+    recentEventNumberSize: manifest.metadata.recentEventNumberSize,
+    actionKindCount: manifest.metadata.actionKindCount,
+    abilityBucketCount: manifest.metadata.abilityBucketCount,
+    actionSelectionSlots: manifest.metadata.selectionSlots,
+    actionNumberSize: manifest.metadata.actionNumberSize,
+  };
 }
 
 async function sha256(buffer: ArrayBuffer): Promise<string> {
@@ -104,13 +127,14 @@ async function createPolicy(): Promise<DestructionPolicy> {
     executionProviders: ["wasm"],
     graphOptimizationLevel: "all",
   });
+  const runtimeMetadata = manifestMetadata(manifest);
   return {
     manifest,
     async choose(state: GameState): Promise<DestructionPolicyDecision> {
       if (trainingActor(state) !== "ai") throw new Error("目前不是破壞模型的決策時點");
       const actions = trainingLegalActions(state);
       if (!actions.length) throw new Error("破壞模型沒有合法動作");
-      const inputs = buildBrowserPolicyInputs(state, actions);
+      const inputs = buildBrowserPolicyInputs(state, actions, runtimeMetadata);
       const feeds: Record<string, ort.Tensor> = {};
       for (const [name, input] of Object.entries(inputs)) {
         feeds[name] = new ort.Tensor(input.type, input.data, input.dims);

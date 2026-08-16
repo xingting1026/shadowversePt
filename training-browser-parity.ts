@@ -3,7 +3,14 @@ import { spawnSync } from "node:child_process";
 import * as ort from "onnxruntime-web/wasm";
 import { buildBrowserPolicyInputs } from "./src/game/browser-policy-input.ts";
 import { createGame, type GameState } from "./src/game/engine.ts";
-import { encodeTrainingAction, encodeTrainingState } from "./src/game/training-encoding.ts";
+import {
+  encodeTrainingAction,
+  encodeTrainingState,
+  TRAINING_CARD_IDS,
+  TRAINING_ENCODING_METADATA,
+  TRAINING_ZONE_NAMES,
+  type TrainingEncodingMetadata,
+} from "./src/game/training-encoding.ts";
 import {
   applyTrainingAction,
   trainingActor,
@@ -19,7 +26,28 @@ type ReferenceObservation = {
 type ReferenceResult = { logits: number[]; value: number };
 
 const modelPath = "public/models/destruction-cycle13.onnx";
+const manifestPath = "public/models/destruction-cycle13.json";
 const checkpointPath = "training-output/league-v1/destruction/current.pt";
+
+/** 舊 manifest 的字典可能比現行卡池小；tensor 維度以 manifest 為準（凍結前綴保證舊索引不變）。 */
+function metadataFromManifest(manifest: { cardIds: string[]; metadata: Record<string, number> }): TrainingEncodingMetadata {
+  const prefixIntact = manifest.cardIds.every((cardId, index) => TRAINING_CARD_IDS[index] === cardId);
+  if (!prefixIntact) throw new Error("manifest cardIds is not a prefix of TRAINING_CARD_IDS — frozen card order was broken");
+  return {
+    cardIds: manifest.cardIds,
+    cardVocabularySize: manifest.metadata.cardVocabularySize,
+    zoneNames: TRAINING_ZONE_NAMES,
+    scalarSize: manifest.metadata.scalarSize,
+    fieldSlots: manifest.metadata.fieldSlots,
+    fieldNumberSize: manifest.metadata.fieldNumberSize,
+    recentEventSlots: manifest.metadata.recentEventSlots,
+    recentEventNumberSize: manifest.metadata.recentEventNumberSize,
+    actionKindCount: manifest.metadata.actionKindCount,
+    abilityBucketCount: manifest.metadata.abilityBucketCount,
+    actionSelectionSlots: manifest.metadata.selectionSlots,
+    actionNumberSize: manifest.metadata.actionNumberSize,
+  };
+}
 
 function playerAction(actions: TrainingAction[]): TrainingAction {
   const mulligan = actions.find((action) => action.kind === "mulligan" && !action.redraw);
@@ -32,9 +60,9 @@ function playerAction(actions: TrainingAction[]): TrainingAction {
     ?? actions.at(-1)!;
 }
 
-async function onnxDecision(session: ort.InferenceSession, state: GameState) {
+async function onnxDecision(session: ort.InferenceSession, state: GameState, metadata: TrainingEncodingMetadata) {
   const actions = trainingLegalActions(state);
-  const raw = buildBrowserPolicyInputs(state, actions);
+  const raw = buildBrowserPolicyInputs(state, actions, metadata);
   const feeds: Record<string, ort.Tensor> = {};
   for (const [name, input] of Object.entries(raw)) feeds[name] = new ort.Tensor(input.type, input.data, input.dims);
   const started = performance.now();
@@ -49,6 +77,11 @@ async function onnxDecision(session: ort.InferenceSession, state: GameState) {
 
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
+const deployedManifest = JSON.parse(await readFile(manifestPath, "utf8")) as { cardIds: string[]; metadata: Record<string, number> };
+const deployedMetadata = metadataFromManifest(deployedManifest);
+if (deployedMetadata.scalarSize !== TRAINING_ENCODING_METADATA.scalarSize) {
+  throw new Error(`scalarSize diverged from the deployed model: ${TRAINING_ENCODING_METADATA.scalarSize} vs ${deployedMetadata.scalarSize}`);
+}
 const session = await ort.InferenceSession.create(await readFile(modelPath), {
   executionProviders: ["wasm"],
   graphOptimizationLevel: "all",
@@ -69,7 +102,7 @@ for (const [index, deck] of (["fairy", "levin"] as const).entries()) {
     const actions = trainingLegalActions(state);
     if (!actions.length) throw new Error(`no legal actions for ${actor} at step ${steps}`);
     if (actor === "ai") {
-      const decision = await onnxDecision(session, state);
+      const decision = await onnxDecision(session, state, deployedMetadata);
       aiDecisions += 1;
       maxInferenceMs = Math.max(maxInferenceMs, decision.inferenceMs);
       if (observations.length < 48) {

@@ -108,7 +108,7 @@ function PlayerVitals({ state, side }: { state: GameState; side: Side }) {
   return (
     <div className={`vitals ${side === "ai" ? "vitals--ai" : "vitals--player"}`}>
       <div className="vitals__identity">
-        <span className="vitals__eyebrow">{side === "ai" ? "cycle 13 對抗模型" : `玩家 · ${state.playerDeck === "levin" ? "1KUUZE" : "7P9XP"}`}</span>
+        <span className="vitals__eyebrow">{side === "ai" ? "cycle 13 對抗模型" : `玩家 · ${state.playerDeck === "levin" ? "1KUUZE" : state.playerDeck === "sekka" ? "D9Q1A" : "7P9XP"}`}</span>
         <strong>{side === "ai" ? "破壊ウィッチ" : PLAYER_DECKS[state.playerDeck].label}</strong>
       </div>
       <div className="vitals__stats">
@@ -194,13 +194,15 @@ function SetupScreen({
   return (
     <main className="setup-shell">
       <section className="setup-card">
-        <div className="setup-card__mark">{deck === "levin" ? "L / W" : "F / W"}</div>
+        <div className="setup-card__mark">{deck === "levin" ? "L / W" : deck === "sekka" ? "S / W" : "F / W"}</div>
         <p className="eyebrow">SHADOWVERSE EVOLVE · 對局研究室</p>
-        <h1>{deck === "levin" ? "雷維翁 vs. 破壊" : "妖精 vs. 破壊"}</h1>
+        <h1>{deck === "levin" ? "雷維翁 vs. 破壊" : deck === "sekka" ? "雪華獸 vs. 破壊" : "妖精 vs. 破壊"}</h1>
         <p className="setup-card__lead">
           {deck === "levin"
             ? "1KUUZE雷維翁皇家牌組：靠棄牌與磨牌把雷維翁堆進墓場，5張開啟全隊強化，アルベール一回合多段疾走收尾。對手是52人賽冠軍破壞巫。"
-            : "固定7P9XP妖精牌組，對戰52人賽冠軍5JK33破壞巫。你操作妖精，對手由妖精與雷維翁共同對抗訓練的破壞模型操作。"}
+            : deck === "sekka"
+              ? "D9Q1A雪華獸エルフ牌組：回手與再展開累積資源，狐火從墓場點燃九火石炎・セッカ，配合セタス與緑の顕現一波鋪場。對手是52人賽冠軍破壞巫。"
+              : "固定7P9XP妖精牌組，對戰52人賽冠軍5JK33破壞巫。你操作妖精，對手由妖精與雷維翁共同對抗訓練的破壞模型操作。"}
         </p>
         <div className={`model-status ${policyError ? "is-error" : policy ? "is-ready" : "is-loading"}`} role="status">
           <span className="model-status__dot" />
@@ -223,6 +225,12 @@ function SetupScreen({
             aria-pressed={deck === "levin"}
             onClick={() => setDeck("levin")}
           >レヴィオンロイヤル</button>
+          <button
+            type="button"
+            className={deck === "sekka" ? "primary-button" : "secondary-button"}
+            aria-pressed={deck === "sekka"}
+            onClick={() => setDeck("sekka")}
+          >雪華獸（セッカ）</button>
         </div>
         <label className="seed-field">
           <span>亂數種子</span>
@@ -509,7 +517,7 @@ export default function GameSimulator() {
       <header className="game-header">
         <div>
           <p className="eyebrow">{PLAYER_DECKS[state.playerDeck].label} × 破壞巫</p>
-          <h1>{state.playerDeck === "levin" ? "雷維翁 vs. 破壊" : "妖精 vs. 破壊"}</h1>
+          <h1>{state.playerDeck === "levin" ? "雷維翁 vs. 破壊" : state.playerDeck === "sekka" ? "雪華獸 vs. 破壊" : "妖精 vs. 破壊"}</h1>
         </div>
         <div className="turn-status">
           <span className={`turn-dot ${state.turnSide === "player" ? "is-player" : "is-ai"}`} />

@@ -4,8 +4,12 @@ import {
   CARDS,
   PLAYER_DECKS,
   cardName,
+  isAcademyCard,
   isAlbert,
+  isBeastCard,
+  isElfClassCard,
   isFairyCard,
+  isFairyTaleCard,
   isIdolCard,
   isLevinCard,
   isLishenna,
@@ -87,8 +91,13 @@ export type PendingChoice = {
 export type AiControl = "scripted" | "manual";
 export const GAME_ENGINE_VERSION = 3 as const;
 
+/** ai 槽使用的牌組；"destruction" 是既有的破壞巫（scripted 規則 AI 專用）。 */
+export type AiDeckId = "destruction" | PlayerDeckId;
+
 export type GameOptions = {
   aiControl?: AiControl;
+  /** ai 槽牌組；非 "destruction" 時必須搭配 aiControl: "manual"。 */
+  aiDeck?: AiDeckId;
 };
 
 export type MatchEvent = {
@@ -114,6 +123,7 @@ export type GameState = {
   winner?: Side | "draw";
   playerFirst: boolean;
   playerDeck: PlayerDeckId;
+  aiDeck: AiDeckId;
   aiControl: AiControl;
   mulliganDone: Record<Side, boolean>;
   turnSide: Side;
@@ -123,6 +133,8 @@ export type GameState = {
   ai: PlayerState;
   playedThisTurn: number;
   evolvedThisTurn: boolean;
+  /** 本回合「從場上回到手牌」的卡（依擁有者分側，記 cardId；含被移除的衍生卡名）。每回合開始雙側清空。 */
+  bouncedThisTurn: Record<Side, string[]>;
   tasks: Task[];
   pending?: PendingChoice;
   log: string[];
@@ -316,37 +328,59 @@ export function hasKeyword(state: GameState, card: CardInstance, keyword: "ward"
   if (keyword === "rush" && card.tempRush) return true;
   if (keyword === "designated" && card.tempDesignated) return true;
   if (keyword === "storm" && card.flags.permStorm) return true;
-  if (card.owner === "player" && keyword === "storm" && card.cardId === "levinAxeGeno" && graveLevin(state) >= 5) return true;
-  if (card.owner === "player" && keyword === "designated" && card.cardId === "levinMeim" && graveLevin(state) >= 5) return true;
-  if (card.owner === "player" && definition(card).token && isFairyCard(card.cardId)) {
-    if (keyword === "rush" && miasmaActive(state)) return true;
-    if (keyword === "designated" && state.player.field.some((item) => item.cardId === "fairyland")) return true;
-    if (keyword === "storm" && state.player.field.some((item) => item.cardId === "queenCynthia")) return true;
-    if (keyword === "designated" && state.player.field.some((item) => item.cardId === "queenCynthia")) return true;
+  if (keyword === "storm" && card.cardId === "levinAxeGeno" && graveLevin(state, card.owner) >= 5) return true;
+  if (keyword === "designated" && card.cardId === "levinMeim" && graveLevin(state, card.owner) >= 5) return true;
+  if (definition(card).token && isFairyCard(card.cardId)) {
+    const ownerField = ps(state, card.owner).field;
+    if (keyword === "rush" && miasmaActive(state, card.owner)) return true;
+    if (keyword === "designated" && ownerField.some((item) => item.cardId === "fairyland")) return true;
+    if (keyword === "storm" && ownerField.some((item) => item.cardId === "queenCynthia")) return true;
+    if (keyword === "designated" && ownerField.some((item) => item.cardId === "queenCynthia")) return true;
   }
   return false;
 }
 
-function graveLevin(state: GameState): number {
-  return state.player.grave.filter((item) => isLevinCard(item.cardId)).length;
+function graveLevin(state: GameState, side: Side = "player"): number {
+  return ps(state, side).grave.filter((item) => isLevinCard(item.cardId)).length;
 }
 
-function graveRoyalFollowers(state: GameState): number {
-  return state.player.grave.filter((item) => isRoyalCard(item.cardId) && isFollower(item)).length;
+function graveRoyalFollowers(state: GameState, side: Side = "player"): number {
+  return ps(state, side).grave.filter((item) => isRoyalCard(item.cardId) && isFollower(item)).length;
 }
 
-function discardPlayerCard(state: GameState, uid: string, reason = "效果"): CardInstance | undefined {
-  const card = removeFromZone(state.player, "hand", uid);
+function graveBeastCards(state: GameState, side: Side): CardInstance[] {
+  return ps(state, side).grave.filter((item) => isBeastCard(item.cardId));
+}
+
+function fieldAcademyBeastFollowers(state: GameState, side: Side): CardInstance[] {
+  return ps(state, side).field.filter((item) => isFollower(item) && (isAcademyCard(item.cardId) || isBeastCard(item.cardId)));
+}
+
+/**
+ * 只要場上有「與目標不同名」的カステル，同側的学院・從者與所有獸・從者不受能力傷害。
+ * （戰鬥傷害不受此保護。）
+ */
+function castelProtector(state: GameState, target: CardInstance): CardInstance | undefined {
+  if (!isFollower(target)) return undefined;
+  if (!isAcademyCard(target.cardId) && !isBeastCard(target.cardId)) return undefined;
+  const targetName = cardName(baseCardId(target));
+  return ps(state, target.owner).field.find((item) =>
+    baseCardId(item) === "castel" && cardName(baseCardId(item)) !== targetName,
+  );
+}
+
+function discardPlayerCard(state: GameState, uid: string, reason = "效果", side: Side = "player"): CardInstance | undefined {
+  const card = removeFromZone(ps(state, side), "hand", uid);
   if (!card) return undefined;
   card.zone = "grave";
-  if (!cardIsToken(card)) state.player.grave.push(card);
-  addLog(state, `你捨棄${cardName(card.cardId)}（${reason}）。`);
-  if (card.cardId === "levinAxeGeno") queueFront(state, { type: "genoDig", side: "player", label: "レヴィオンアックス・ジェノ的捨棄能力" });
+  if (!cardIsToken(card)) ps(state, side).grave.push(card);
+  addLog(state, `${side === "player" ? "你" : "對手"}捨棄${cardName(card.cardId)}（${reason}）。`);
+  if (card.cardId === "levinAxeGeno") queueFront(state, { type: "genoDig", side, label: "レヴィオンアックス・ジェノ的捨棄能力" });
   return card;
 }
 
-function miasmaActive(state: GameState): boolean {
-  return [...state.player.field, ...state.player.ex].some((item) =>
+function miasmaActive(state: GameState, side: Side = "player"): boolean {
+  return [...ps(state, side).field, ...ps(state, side).ex].some((item) =>
     item.cardId === "miasmaAria" || item.cardId === "miasmaAriaEvo",
   );
 }
@@ -367,8 +401,8 @@ function idolField(state: GameState, side: Side = "ai"): CardInstance[] {
   return ps(state, side).field.filter((item) => isIdolCard(item.cardId));
 }
 
-function eggField(state: GameState): CardInstance[] {
-  return state.ai.field.filter((item) => item.cardId === "newWhite" || item.cardId === "newBlack");
+function eggField(state: GameState, side: Side = "ai"): CardInstance[] {
+  return ps(state, side).field.filter((item) => item.cardId === "newWhite" || item.cardId === "newBlack");
 }
 
 function canFitField(state: GameState, side: Side): boolean {
@@ -490,8 +524,21 @@ function destroyFollower(state: GameState, card: CardInstance, reason = "破壞"
   moveFieldToGrave(state, card, reason);
 }
 
-function dealDamageToFollower(state: GameState, card: CardInstance, amount: number, source = "效果"): void {
+function dealDamageToFollower(
+  state: GameState,
+  card: CardInstance,
+  amount: number,
+  source = "效果",
+  damageType: "ability" | "combat" = "ability",
+): void {
   if (!findInField(state, card.uid)) return;
+  if (damageType === "ability" && amount > 0) {
+    const protector = castelProtector(state, card);
+    if (protector) {
+      addLog(state, `${cardName(baseCardId(protector))}使${cardName(card.cardId)}不受能力傷害（${source}）。`);
+      return;
+    }
+  }
   card.damage += amount;
   addLog(state, `${cardName(card.cardId)}受到${amount}點傷害（${source}）。`);
   if (remainingHealthOf(card) <= 0) destroyFollower(state, card, "傷害");
@@ -511,11 +558,12 @@ function putExistingIntoField(state: GameState, card: CardInstance, side: Side, 
   card.tempStorm = false;
   card.tempRush = false;
   card.tempDesignated = false;
+  delete card.flags.fromHand;
   ps(state, side).field.push(card);
 
-  if (side === "player" && definition(card).token && isFairyCard(card.cardId)) {
-    const fairylands = state.player.field.filter((item) => item.cardId === "fairyland").length;
-    const cynthias = state.player.field.filter((item) => item.cardId === "queenCynthia").length;
+  if (definition(card).token && isFairyCard(card.cardId)) {
+    const fairylands = ps(state, side).field.filter((item) => item.cardId === "fairyland").length;
+    const cynthias = ps(state, side).field.filter((item) => item.cardId === "queenCynthia").length;
     card.attackBuff += fairylands + cynthias * 2;
     card.healthBuff += fairylands;
   }
@@ -525,14 +573,19 @@ function putExistingIntoField(state: GameState, card: CardInstance, side: Side, 
       queue(state, { type: "aiDamageBestFollower", side: "ai", sourceUid: axia.uid, amount: 2, label: "アクシア的每回合一次傷害" });
     }
   }
-  if (side === "player" && state.turnSide === "player" && isFollower(card) && isAlbert(card.cardId)) {
-    for (const runes of state.player.field.filter((item) => item.cardId === "levinRunesEvo" && item.uid !== card.uid)) {
-      queue(state, { type: "runesSnipe", side: "player", sourceUid: runes.uid, label: "ルネス（EVOLVE）的アルベール進場效果" });
+  if (state.turnSide === side && isFollower(card) && isAlbert(card.cardId)) {
+    for (const runes of ps(state, side).field.filter((item) => item.cardId === "levinRunesEvo" && item.uid !== card.uid)) {
+      queue(state, { type: "runesSnipe", side, sourceUid: runes.uid, label: "ルネス（EVOLVE）的アルベール進場效果" });
+    }
+  }
+  if (isFollower(card) && (isAcademyCard(card.cardId) || isBeastCard(card.cardId))) {
+    for (const dwarf of ps(state, side).field.filter((item) => baseCardId(item) === "axeDwarf" && item.uid !== card.uid)) {
+      queue(state, { type: "dwarfSnipe", side, sourceUid: dwarf.uid, label: "伐採斧のドワーフ的進場觸發" });
     }
   }
   if (triggerFanfare) {
     const fanfare: Task = { type: "fanfare", side, sourceUid: card.uid, cardId: card.cardId, label: `${cardName(card.cardId)}的入場曲` };
-    if (side === "player" && isFollower(card) && hasKeyword(state, card, "ward")) {
+    if (isFollower(card) && hasKeyword(state, card, "ward")) {
       queue(state, { type: "wardOnEntry", side, sourceUid: card.uid, data: { tasks: [fanfare] }, label: `${cardName(card.cardId)}的守護進場選擇` });
     } else queue(state, fanfare);
   }
@@ -592,6 +645,13 @@ export function createGame(
   options: GameOptions = {},
 ): GameState {
   const deck = PLAYER_DECKS[playerDeck];
+  const aiDeck: AiDeckId = options.aiDeck ?? "destruction";
+  if (aiDeck !== "destruction" && (options.aiControl ?? "scripted") !== "manual") {
+    throw new Error(`aiDeck "${aiDeck}" requires aiControl "manual": the scripted rules AI only plays the Destruction deck`);
+  }
+  const aiLists = aiDeck === "destruction"
+    ? { main: AI_DECK, evolve: AI_EVOLVE }
+    : { main: PLAYER_DECKS[aiDeck].main, evolve: PLAYER_DECKS[aiDeck].evolve };
   const state: GameState = {
     version: GAME_ENGINE_VERSION,
     seed: seed >>> 0,
@@ -601,21 +661,23 @@ export function createGame(
     status: "mulligan",
     playerFirst,
     playerDeck,
+    aiDeck,
     aiControl: options.aiControl ?? "scripted",
     mulliganDone: { player: false, ai: false },
     turnSide: playerFirst ? "player" : "ai",
     globalTurn: 0,
     phase: "setup",
     player: emptyPlayer(deck.evolve),
-    ai: emptyPlayer(AI_EVOLVE),
+    ai: emptyPlayer(aiLists.evolve),
     playedThisTurn: 0,
     evolvedThisTurn: false,
+    bouncedThisTurn: { player: [], ai: [] },
     tasks: [],
     log: [],
     events: [],
   };
   createSide(state, "player", deck.main, deck.evolve);
-  createSide(state, "ai", AI_DECK, AI_EVOLVE);
+  createSide(state, "ai", aiLists.main, aiLists.evolve);
   state.player.ep = playerFirst ? 0 : 3;
   state.ai.ep = playerFirst ? 3 : 0;
   addLog(state, `遊戲種子：${state.seed}。你使用${deck.label}，選擇${playerFirst ? "先攻" : "後攻"}。`);
@@ -709,10 +771,13 @@ function beginTurnMutable(state: GameState, side: Side): void {
   state.phase = side === "player" || state.aiControl === "manual" ? "main" : "ai";
   state.playedThisTurn = 0;
   state.evolvedThisTurn = false;
+  state.bouncedThisTurn = { player: [], ai: [] };
   for (const card of [...state.player.field, ...state.ai.field]) {
     delete card.flags.axiaTriggered;
     delete card.flags.freeEvolve;
     delete card.flags.albertRestandUsed;
+    delete card.flags.cetusPpUsed;
+    delete card.flags.tigerStrikeChecked;
   }
   const player = ps(state, side);
   player.ownTurn += 1;
@@ -759,8 +824,9 @@ function taskLabel(task: Task): string {
   return task.label ?? (task.cardId ? `${cardName(task.cardId)}的效果` : "卡片效果");
 }
 
-function setTriggerOrder(state: GameState, tasks: Task[]): void {
-  if (tasks.length <= 1) {
+function setTriggerOrder(state: GameState, tasks: Task[], forSide: Side = "player"): void {
+  // ai 槽（雙策略模式）沿用既有慣例：同時觸發依排入順序結算，不開排序選擇。
+  if (tasks.length <= 1 || forSide !== "player") {
     queueFront(state, ...tasks);
     return;
   }
@@ -822,7 +888,7 @@ function putBottom(state: GameState, side: Side, cards: CardInstance[]): void {
   ps(state, side).deck.unshift(...cards);
 }
 
-function userTopSearch(state: GameState, cards: CardInstance[], eligible: CardInstance[], effect: string, title: string, max = 1): void {
+function userTopSearch(state: GameState, cards: CardInstance[], eligible: CardInstance[], effect: string, title: string, max = 1, side: Side = "player"): void {
   state.pending = {
     kind: "multi",
     effect,
@@ -835,6 +901,7 @@ function userTopSearch(state: GameState, cards: CardInstance[], eligible: CardIn
     })),
     min: 0,
     max,
+    side,
     data: { cards, eligible: eligible.map((item) => item.uid) },
   };
 }
@@ -884,11 +951,11 @@ function shuffleAfterSearch(state: GameState, side: Side, source: string): void 
   addLog(state, `${source}檢索完成，${side === "player" ? "你" : "破壞巫"}洗牌。`);
 }
 
-function beginRunesAlbertSearch(state: GameState): void {
-  const candidates = searchDeckInstances(state, "player", (item) => isAlbert(item.cardId));
+function beginRunesAlbertSearch(state: GameState, side: Side = "player"): void {
+  const candidates = searchDeckInstances(state, side, (item) => isAlbert(item.cardId));
   if (!candidates.length) {
     addLog(state, "牌庫中已沒有符合條件的『アルベール』[ロイヤル]從者（可以檢索失敗）。");
-    shuffleAfterSearch(state, "player", "ルネス");
+    shuffleAfterSearch(state, side, "ルネス");
     return;
   }
   state.pending = {
@@ -899,14 +966,15 @@ function beginRunesAlbertSearch(state: GameState): void {
     options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
     min: 0,
     max: 1,
+    side,
   };
 }
 
-function beginJusticeSaberSearch(state: GameState): void {
-  const candidates = searchDeckInstances(state, "player", (item) => cardName(item.cardId) === "レヴィオンセイバー・アルベール");
-  if (!candidates.length || !canFitField(state, "player")) {
+function beginJusticeSaberSearch(state: GameState, side: Side = "player"): void {
+  const candidates = searchDeckInstances(state, side, (item) => cardName(item.cardId) === "レヴィオンセイバー・アルベール");
+  if (!candidates.length || !canFitField(state, side)) {
     addLog(state, !candidates.length ? "牌庫中沒有『レヴィオンセイバー・アルベール』，追加檢索落空。" : "場上已滿，可以讓レヴィオンセイバー・アルベール的追加檢索落空。");
-    shuffleAfterSearch(state, "player", "レヴィオンの正義（追加檢索）");
+    shuffleAfterSearch(state, side, "レヴィオンの正義（追加檢索）");
     return;
   }
   state.pending = {
@@ -917,14 +985,15 @@ function beginJusticeSaberSearch(state: GameState): void {
     options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
     min: 0,
     max: 1,
+    side,
   };
 }
 
-function finishJusticeDukeSearch(state: GameState, kicker: boolean, pickedUid?: string): void {
-  if (pickedUid && canFitField(state, "player")) {
-    const duke = removeDeckInstance(state, "player", pickedUid);
+function finishJusticeDukeSearch(state: GameState, kicker: boolean, pickedUid?: string, side: Side = "player"): void {
+  if (pickedUid && canFitField(state, side)) {
+    const duke = removeDeckInstance(state, side, pickedUid);
     if (duke?.cardId === "levinDuke") {
-      putExistingIntoField(state, duke, "player", true);
+      putExistingIntoField(state, duke, side, true);
       addLog(state, "レヴィオンの正義將レヴィオンデューク・ユリウス放置到場上。");
     }
   } else if (pickedUid) {
@@ -932,16 +1001,16 @@ function finishJusticeDukeSearch(state: GameState, kicker: boolean, pickedUid?: 
   } else {
     addLog(state, "你選擇讓ユリウス的檢索落空。");
   }
-  shuffleAfterSearch(state, "player", "レヴィオンの正義");
-  if (kicker) beginJusticeSaberSearch(state);
+  shuffleAfterSearch(state, side, "レヴィオンの正義");
+  if (kicker) beginJusticeSaberSearch(state, side);
 }
 
-function beginJusticeDukeSearch(state: GameState, kicker: boolean): void {
-  const candidates = searchDeckInstances(state, "player", (item) => item.cardId === "levinDuke");
-  if (!candidates.length || !canFitField(state, "player")) {
+function beginJusticeDukeSearch(state: GameState, kicker: boolean, side: Side = "player"): void {
+  const candidates = searchDeckInstances(state, side, (item) => item.cardId === "levinDuke");
+  if (!candidates.length || !canFitField(state, side)) {
     addLog(state, !candidates.length ? "牌庫中找不到レヴィオンデューク・ユリウス（可以檢索失敗）。" : "場上已滿，可以不找出ユリウス。");
-    shuffleAfterSearch(state, "player", "レヴィオンの正義");
-    if (kicker) beginJusticeSaberSearch(state);
+    shuffleAfterSearch(state, side, "レヴィオンの正義");
+    if (kicker) beginJusticeSaberSearch(state, side);
     return;
   }
   state.pending = {
@@ -952,89 +1021,91 @@ function beginJusticeDukeSearch(state: GameState, kicker: boolean): void {
     options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
     min: 0,
     max: 1,
+    side,
     data: { kicker },
   };
 }
 
-function deploySistersSimultaneously(state: GameState, selectedUids: string[]): void {
+function deploySistersSimultaneously(state: GameState, selectedUids: string[], side: Side = "player"): void {
   const entering = selectedUids
-    .map((uid) => removeDeckInstance(state, "player", uid))
+    .map((uid) => removeDeckInstance(state, side, uid))
     .filter(Boolean) as CardInstance[];
   const entered: CardInstance[] = [];
   for (const card of entering) {
-    if (putExistingIntoField(state, card, "player", false)) {
+    if (putExistingIntoField(state, card, side, false)) {
       entered.push(card);
       addLog(state, `レヴィオンシスターズ登場！將${cardName(card.cardId)}放置到場上。`);
     }
   }
   const triggers: Task[] = entered.map((card) => {
-    const fanfare: Task = { type: "fanfare", side: "player", sourceUid: card.uid, cardId: card.cardId, label: `${cardName(card.cardId)}的入場曲` };
+    const fanfare: Task = { type: "fanfare", side, sourceUid: card.uid, cardId: card.cardId, label: `${cardName(card.cardId)}的入場曲` };
     return hasKeyword(state, card, "ward")
-      ? { type: "wardOnEntry", side: "player", sourceUid: card.uid, data: { tasks: [fanfare] }, label: `${cardName(card.cardId)}的守護進場選擇` }
+      ? { type: "wardOnEntry", side, sourceUid: card.uid, data: { tasks: [fanfare] }, label: `${cardName(card.cardId)}的守護進場選擇` }
       : fanfare;
   });
-  if (triggers.length) setTriggerOrder(state, triggers);
+  if (triggers.length) setTriggerOrder(state, triggers, side);
 }
 
-function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined, cardId: string): void {
+function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined, cardId: string, side: Side = "player"): void {
+  const enemy = otherSide(side);
   switch (cardId) {
     case "naturalAria":
-      addExTask(state, "player", ["fairy", "fairy"]);
+      addExTask(state, side, ["fairy", "fairy"]);
       break;
     case "pureWaterFairy":
-      addExTask(state, "player", ["fairy"]);
+      addExTask(state, side, ["fairy"]);
       break;
     case "vistaElf":
-      addExTask(state, "player", ["fairyWisp"]);
+      addExTask(state, side, ["fairyWisp"]);
       break;
     case "fairyDragon": {
       if (!source) break;
-      const count = fieldFairyTokens(state).length + state.player.ex.filter((item) => definition(item).token && isFairyCard(item.cardId) && isFollower(item)).length;
+      const count = fieldFairyTokens(state, side).length + ps(state, side).ex.filter((item) => definition(item).token && isFairyCard(item.cardId) && isFollower(item)).length;
       source.attackBuff += count;
       addLog(state, `フェアリードラゴン因${count}張妖精衍生卡獲得+${count}攻擊力。`);
       break;
     }
     case "fairyBladeAmatsu":
-      addExTask(state, "player", ["fairy"], [{ type: "buffExFairies", side: "player", amount: 1 }]);
+      addExTask(state, side, ["fairy"], [{ type: "buffExFairies", side, amount: 1 }]);
       break;
     case "breathFairyDancer":
-      for (const card of state.player.field) {
+      for (const card of ps(state, side).field) {
         if (card.uid !== source?.uid && isFairyCard(card.cardId) && isFollower(card)) {
           card.attackBuff += 1;
           card.healthBuff += 1;
         }
       }
-      for (const card of exFairyFollowers(state)) {
+      for (const card of exFairyFollowers(state, side)) {
         card.attackBuff += 1;
         card.healthBuff += 1;
       }
       addLog(state, "ブレスフェアリーダンサー強化場上其他妖精與EX妖精。 ");
       break;
     case "fairyArcher": {
-      spawnToken(state, "player", "fairy");
-      const cards = topCards(state, "player", 3);
-      userTopSearch(state, cards, cards.filter((item) => isFairyCard(item.cardId)), "fairyArcherPick", "妖精の弓使い：查看牌頂3張");
+      spawnToken(state, side, "fairy");
+      const cards = topCards(state, side, 3);
+      userTopSearch(state, cards, cards.filter((item) => isFairyCard(item.cardId)), "fairyArcherPick", "妖精の弓使い：查看牌頂3張", 1, side);
       break;
     }
     case "miasmaAria":
-      addExTask(state, "player", ["fairy"]);
+      addExTask(state, side, ["fairy"]);
       break;
     case "riotousGarden":
-      spawnToken(state, "player", "fairy");
+      spawnToken(state, side, "fairy");
       break;
     case "wonderTree":
-      addExTask(state, "player", ["fairy"]);
+      addExTask(state, side, ["fairy"]);
       break;
     case "bouquetFairy":
-      addExTask(state, "player", ["fairyWisp"]);
+      addExTask(state, side, ["fairyWisp"]);
       break;
     case "wingQueen": {
-      if (exFairyCards(state).length < 2) break;
-      const choices = searchDeckInstances(state, "player", (item) => {
+      if (exFairyCards(state, side).length < 2) break;
+      const choices = searchDeckInstances(state, side, (item) => {
         const def = definition(item);
         return def.kind === "follower" && isFairyCard(item.cardId) && def.cost <= 3 && item.cardId !== "wingQueen";
       });
-      if (!choices.length || !canFitField(state, "player")) break;
+      if (!choices.length || !canFitField(state, side)) break;
       state.pending = {
         kind: "single",
         effect: "wingQueenTutor",
@@ -1043,14 +1114,15 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
         options: choices.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
       };
       break;
     }
     case "queenCynthia":
-      addExTask(state, "player", ["fairyWisp"], [{ type: "buffFieldFairyTokensAttack", side: "player", amount: 2 }]);
+      addExTask(state, side, ["fairyWisp"], [{ type: "buffFieldFairyTokensAttack", side, amount: 2 }]);
       break;
     case "fairyland":
-      for (const token of fieldFairyTokens(state)) {
+      for (const token of fieldFairyTokens(state, side)) {
         token.attackBuff += 1;
         token.healthBuff += 1;
       }
@@ -1058,7 +1130,7 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
       break;
     case "levinMiim":
     case "levinRunes": {
-      const levinHand = state.player.hand.filter((item) => isLevinCard(item.cardId));
+      const levinHand = ps(state, side).hand.filter((item) => isLevinCard(item.cardId));
       if (!levinHand.length) break;
       state.pending = {
         kind: "multi",
@@ -1070,19 +1142,20 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
         options: levinHand.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 0,
         max: 1,
+        side,
       };
       break;
     }
     case "gawain": {
       if (!source) break;
-      const royals = graveRoyalFollowers(state);
+      const royals = graveRoyalFollowers(state, side);
       if (royals >= 5) {
-        drawCards(state, "player", 1);
+        drawCards(state, side, 1);
         addLog(state, "ガウェイン：墓場[ロイヤル]從者5+，抽1張。 ");
       }
       if (royals >= 10) {
         source.flags.permStorm = true;
-        healLeader(state, "player", 2);
+        healLeader(state, side, 2);
         addLog(state, "ガウェイン：10+，獲得【疾走】。 ");
       }
       if (royals >= 15) {
@@ -1098,7 +1171,7 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
       break;
     }
     case "levinMaim": {
-      const targets = state.ai.field.filter(isFollower);
+      const targets = ps(state, enemy).field.filter(isFollower);
       if (!targets.length) break;
       state.pending = {
         kind: "single",
@@ -1108,11 +1181,12 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
         options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
       };
       break;
     }
     case "levinArcher": {
-      const cards = topCards(state, "player", 2);
+      const cards = topCards(state, side, 2);
       if (!cards.length) break;
       state.pending = {
         kind: "multi",
@@ -1126,12 +1200,13 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
         })),
         min: 0,
         max: 1,
+        side,
         data: { cards },
       };
       break;
     }
     case "levinTranscend": {
-      const levinHand = state.player.hand.filter((item) => isLevinCard(item.cardId));
+      const levinHand = ps(state, side).hand.filter((item) => isLevinCard(item.cardId));
       if (levinHand.length < 2) break;
       state.pending = {
         kind: "yesNo",
@@ -1141,11 +1216,12 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
         options: [{ uid: "yes", label: "公開2張並發動" }, { uid: "no", label: "不公開、不發動" }],
         min: 1,
         max: 1,
+        side,
       };
       break;
     }
     case "brutalGeno": {
-      const targets = state.ai.field.filter(isFollower);
+      const targets = ps(state, enemy).field.filter(isFollower);
       if (!targets.length) break;
       state.pending = {
         kind: "single",
@@ -1155,11 +1231,12 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
         options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
       };
       break;
     }
     case "levinAlbert": {
-      const others = state.player.field.filter((item) => item.uid !== source?.uid && isLevinCard(item.cardId) && isFollower(item));
+      const others = ps(state, side).field.filter((item) => item.uid !== source?.uid && isLevinCard(item.cardId) && isFollower(item));
       if (!others.length) break;
       state.pending = {
         kind: "single",
@@ -1169,6 +1246,147 @@ function resolvePlayerFanfare(state: GameState, source: CardInstance | undefined
         options: others.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
+      };
+      break;
+    }
+    case "owlman": {
+      const others = ps(state, side).field.filter((item) => item.uid !== source?.uid && isFollower(item) && isBeastCard(item.cardId));
+      if (!others.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "owlmanBuff",
+        title: "オウルマン",
+        prompt: "選擇自己場上其他1體獸・從者，使其攻擊力+1／體力+1。",
+        options: others.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "foxfireSekka": {
+      const cards = topCards(state, side, 3);
+      if (!cards.length) break;
+      const eligible = cards.filter((item) => isElfClassCard(item.cardId) && definition(item).cost <= 2);
+      userTopSearch(state, cards, eligible, "foxfirePick", "宿命の狐火・セッカ：查看牌頂3張", 1, side);
+      break;
+    }
+    case "castel": {
+      if (fieldAcademyBeastFollowers(state, side).length >= 3) addExTask(state, side, ["greenManifest"]);
+      break;
+    }
+    case "cheshireCat": {
+      const enemyFollowers = ps(state, enemy).field.filter(isFollower);
+      const amount = source?.flags.fromHand ? 1 : 2;
+      state.pending = {
+        kind: "single",
+        effect: "cheshireDamage",
+        title: "チェシャキャット",
+        prompt: `選擇對方主戰者或對方1體從者，對其造成${amount}點傷害。`,
+        options: [
+          { uid: `${enemy}-leader`, label: enemy === "ai" ? "對方主戰者" : "你的主戰者" },
+          ...enemyFollowers.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        ],
+        min: 1,
+        max: 1,
+        side,
+        data: { amount },
+      };
+      break;
+    }
+    case "babyCarbuncle": {
+      const targets = ps(state, side).field.filter((item) =>
+        item.uid !== source?.uid && isBeastCard(item.cardId) && cardName(baseCardId(item)) !== "ベビーカーバンクル");
+      if (!targets.length) break;
+      state.pending = {
+        kind: "multi",
+        effect: "carbuncleBounce",
+        title: "ベビーカーバンクル",
+        prompt: "可以將自己場上「同名除外的獸・卡牌」1張返回手牌：抽1張牌。也可以不選。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "anemoneTiger": {
+      const targets = ps(state, side).field.filter((item) =>
+        item.uid !== source?.uid && isFollower(item) && isBeastCard(item.cardId) && cardName(baseCardId(item)) !== "アネモネタイガー");
+      if (!targets.length) break;
+      state.pending = {
+        kind: "multi",
+        effect: "anemoneBounce",
+        title: "アネモネタイガー",
+        prompt: "可以將自己場上「同名除外的獸・從者」1體返回手牌：從牌庫找出1張『サルビアパンサー』加入手牌。也可以不選。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "cuttingCat": {
+      const hand = ps(state, side).hand;
+      if (!hand.length) break;
+      state.pending = {
+        kind: "multi",
+        effect: "cuttingDiscard",
+        title: "カッティングキャット",
+        prompt: "可以捨棄1張手牌：查看牌頂3張，可公開1張学院或獸・卡牌加入手牌。不捨棄則跳過整個效果。",
+        options: hand.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "cetusSun": {
+      for (let repeat = 0; repeat < 2; repeat += 1) {
+        if (ps(state, side).ex.length >= 5) {
+          addLog(state, "EX區已滿，セタス的入場曲中止。 ");
+          break;
+        }
+        const top = ps(state, side).deck.pop();
+        if (!top) break;
+        top.zone = "ex";
+        ps(state, side).ex.push(top);
+        addLog(state, `セタス將牌庫頂的${cardName(top.cardId)}置入EX區。`);
+        if (isBeastCard(top.cardId)) healLeader(state, side, 2);
+      }
+      break;
+    }
+    case "axeDwarf": {
+      const candidates = ps(state, side).hand.filter((item) =>
+        isFollower(item) && definition(item).cost <= 4 && (isAcademyCard(item.cardId) || isBeastCard(item.cardId)));
+      if (!candidates.length || !canFitField(state, side)) break;
+      state.pending = {
+        kind: "multi",
+        effect: "dwarfDeploy",
+        title: "伐採斧のドワーフ",
+        prompt: "可以將手牌中1張原本費用4以下的学院或獸・從者放置到場上（會觸發入場曲）。也可以不選。",
+        options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "sekkaAdvance": {
+      const graveNinetails = ps(state, side).grave.filter((item) => item.cardId === "ninetailResolve");
+      state.pending = {
+        kind: "single",
+        effect: "sekkaAdvanceMode",
+        title: "九火石炎・セッカ",
+        prompt: "選擇1項：①從牌庫找出『九尾の決意』加入手牌（之後洗牌）；②從墓場選1張『九尾の決意』加入手牌。",
+        options: [
+          { uid: "deck", label: "①從牌庫找出『九尾の決意』" },
+          ...graveNinetails.map((item) => ({ uid: item.uid, cardId: item.cardId, label: "②從墓場拿回『九尾の決意』" })),
+        ],
+        min: 1,
+        max: 1,
+        side,
       };
       break;
     }
@@ -1384,8 +1602,11 @@ function resolveFanfare(state: GameState, task: Task): void {
   const source = task.sourceUid ? findInField(state, task.sourceUid) : undefined;
   const cardId = task.cardId ?? source?.cardId;
   if (!cardId) return;
-  if ((task.side ?? source?.owner) === "player") resolvePlayerFanfare(state, source, cardId);
-  else resolveAiFanfare(state, source, cardId);
+  const side = task.side ?? source?.owner ?? "player";
+  // 依卡片所屬牌組分派：破壞巫卡（def.side === "ai"）走破壞巫結算；
+  // fairy/levin 卡不論在哪個槽位都走 side-relative 的玩家牌組結算。
+  if (definition(cardId).side === "ai") resolveAiFanfare(state, source, cardId);
+  else resolvePlayerFanfare(state, source, cardId, side);
 }
 
 function resolveTask(state: GameState, task: Task): void {
@@ -1404,7 +1625,7 @@ function resolveTask(state: GameState, task: Task): void {
       const source = task.sourceUid ? findInField(state, task.sourceUid) : undefined;
       const after = (task.data?.tasks as Task[]) ?? [];
       if (!source || source.tapped || !hasKeyword(state, source, "ward")) {
-        if (after.length) setTriggerOrder(state, after);
+        if (after.length) setTriggerOrder(state, after, side);
         break;
       }
       state.pending = {
@@ -1415,6 +1636,7 @@ function resolveTask(state: GameState, task: Task): void {
         options: [{ uid: "yes", label: "以橫置狀態進場" }, { uid: "no", label: "保持直立" }],
         min: 1,
         max: 1,
+        side,
         data: { sourceUid: source.uid, tasks: after },
       };
       break;
@@ -1541,19 +1763,18 @@ function resolveTask(state: GameState, task: Task): void {
       addLog(state, `場上妖精衍生卡獲得+${task.amount ?? 0}攻擊力。`);
       break;
     case "miasmaLastWord": {
-      if (side === "player") {
-        const exFull = state.player.ex.length >= 5;
-        state.pending = {
-          kind: "yesNo",
-          effect: "miasmaLastWord",
-          title: "瘴気の妖精姫・アリア",
-          prompt: "要將墓場中的這張アリア放入EX區嗎？EX已滿時不能選擇。",
-          options: [{ uid: "yes", label: "放入EX", description: exFull ? "不符合：EX區已滿" : undefined }, { uid: "no", label: "留在墓場" }],
-          min: 1,
-          max: 1,
-          data: { sourceUid: task.sourceUid },
-        };
-      }
+      const exFull = ps(state, side).ex.length >= 5;
+      state.pending = {
+        kind: "yesNo",
+        effect: "miasmaLastWord",
+        title: "瘴気の妖精姫・アリア",
+        prompt: "要將墓場中的這張アリア放入EX區嗎？EX已滿時不能選擇。",
+        options: [{ uid: "yes", label: "放入EX", description: exFull ? "不符合：EX區已滿" : undefined }, { uid: "no", label: "留在墓場" }],
+        min: 1,
+        max: 1,
+        side,
+        data: { sourceUid: task.sourceUid },
+      };
       break;
     }
     case "tailwindHeal":
@@ -1588,37 +1809,31 @@ function resolveTask(state: GameState, task: Task): void {
     case "reverseEvolve": {
       const targets = ps(state, otherSide(side)).field.filter(isFollower);
       if (!targets.length) break;
-      if (side === "player") {
-        state.pending = {
-          kind: "single",
-          effect: "reverseEvolveTarget",
-          title: "リバースブレイダー・アマツ",
-          prompt: "選擇對方1體從者。結算時會分別檢查EX卡3張、EX妖精卡3張。",
-          options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
-          min: 1,
-          max: 1,
-        };
-      } else {
-        const target = bestFollower(state, "player");
-        if (target && ps(state, side).ex.length >= 3) destroyFollower(state, target, "リバースブレイダー・アマツ");
-        if (exFairyCards(state, side).length >= 3) damageLeader(state, "player", 2);
-      }
+      state.pending = {
+        kind: "single",
+        effect: "reverseEvolveTarget",
+        title: "リバースブレイダー・アマツ",
+        prompt: "選擇對方1體從者。結算時會分別檢查EX卡3張、EX妖精卡3張。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
       break;
     }
     case "miasmaEvolve": {
       const choices = searchDeckInstances(state, side, (item) => isAmulet(item) && isFairyCard(item.cardId) && definition(item).cost <= 2);
       if (!choices.length || !canFitField(state, side)) break;
-      if (side === "player") {
-        state.pending = {
-          kind: "single",
-          effect: "miasmaAmuletTutor",
-          title: "瘴気の妖精姫・アリア",
-          prompt: "選擇原本費用2以下的妖精護符，從牌庫直接放到場上；會觸發其入場曲。",
-          options: choices.map((item) => ({ uid: item.uid, cardId: item.cardId })),
-          min: 1,
-          max: 1,
-        };
-      }
+      state.pending = {
+        kind: "single",
+        effect: "miasmaAmuletTutor",
+        title: "瘴気の妖精姫・アリア",
+        prompt: "選擇原本費用2以下的妖精護符，從牌庫直接放到場上；會觸發其入場曲。",
+        options: choices.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
       break;
     }
     case "naturalAriaSuper":
@@ -1685,7 +1900,8 @@ function resolveTask(state: GameState, task: Task): void {
       break;
     }
     case "genoDig": {
-      const top = state.player.deck[state.player.deck.length - 1];
+      const deck = ps(state, side).deck;
+      const top = deck[deck.length - 1];
       if (!top) break;
       state.pending = {
         kind: "multi",
@@ -1695,6 +1911,7 @@ function resolveTask(state: GameState, task: Task): void {
         options: [{ uid: top.uid, cardId: top.cardId, description: isLevinCard(top.cardId) ? undefined : "不是雷維翁・卡牌，不能加入手牌" }],
         min: 0,
         max: 1,
+        side,
         data: { topUid: top.uid },
       };
       break;
@@ -1710,6 +1927,7 @@ function resolveTask(state: GameState, task: Task): void {
         options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 0,
         max: 1,
+        side,
       };
       break;
     }
@@ -1724,13 +1942,14 @@ function resolveTask(state: GameState, task: Task): void {
         options: alberts.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 0,
         max: 1,
+        side,
       };
       break;
     }
     case "maimEvolve": {
       const cards = topCards(state, side, 4);
       if (!cards.length) break;
-      userTopSearch(state, cards, cards.filter((item) => isLevinCard(item.cardId)), "maimEvoPick", "マイム（EVOLVE）：查看牌頂4張");
+      userTopSearch(state, cards, cards.filter((item) => isLevinCard(item.cardId)), "maimEvoPick", "マイム（EVOLVE）：查看牌頂4張", 1, side);
       break;
     }
     case "transcendDestroy": {
@@ -1744,6 +1963,7 @@ function resolveTask(state: GameState, task: Task): void {
         options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
       };
       break;
     }
@@ -1758,6 +1978,7 @@ function resolveTask(state: GameState, task: Task): void {
         options: ps(state, side).hand.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
       };
       break;
     }
@@ -1792,6 +2013,146 @@ function resolveTask(state: GameState, task: Task): void {
       putBottom(state, side, cards);
       break;
     }
+    case "rabbitReturn": {
+      const rabbits = ps(state, side).hand.filter((item) => item.cardId === "swordRabbit");
+      if (!rabbits.length || !canFitField(state, side)) break;
+      state.pending = {
+        kind: "multi",
+        effect: "rabbitReturn",
+        title: "ソードラビット",
+        prompt: "此卡從場上回到手牌：可以將手牌中1張『ソードラビット』放置到場上。也可以不選。",
+        options: rabbits.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "dwarfSnipe": {
+      const targets = ps(state, otherSide(side)).field.filter(isFollower);
+      if (!targets.length || !ps(state, side).field.some((item) => item.uid === task.sourceUid)) break;
+      state.pending = {
+        kind: "single",
+        effect: "dwarfSnipe",
+        title: "伐採斧のドワーフ",
+        prompt: "選擇對方場上1體從者：對其造成5點傷害，並對其主戰者造成1點傷害。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "foxfireDiscard": {
+      const hand = ps(state, side).hand;
+      if (!hand.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "foxfireDiscard",
+        title: "宿命の狐火・セッカ",
+        prompt: "已公開1張卡加入手牌，必須捨棄1張手牌。",
+        options: hand.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "greenBuff": {
+      for (const card of ps(state, side).field.filter(isFollower)) {
+        card.attackBuff += 1;
+        card.healthBuff += 1;
+      }
+      addLog(state, "緑の顕現使自己場上所有從者+1/+1。 ");
+      break;
+    }
+    case "ninetailMode1": {
+      const targets = ps(state, side).field.filter((item) => baseCardId(item) === "sekkaAdvance");
+      if (!targets.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "ninetailMode1Target",
+        title: "九尾の決意①",
+        prompt: "選擇自己場上1體『九火石炎・セッカ』。結算時若消滅領域有9張以上卡牌，+2/+2並獲得【疾走】。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "ninetailMode2": {
+      const own = ps(state, side).field.filter((item) => isFollower(item) && cardName(baseCardId(item)).includes("セッカ"));
+      const enemies = ps(state, otherSide(side)).field.filter(isFollower);
+      if (!own.length || !enemies.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "ninetailMode2Own",
+        title: "九尾の決意②",
+        prompt: "選擇自己場上1體卡名包含『セッカ』的從者（+2/+2，之後以其攻擊力對對方從者造成傷害）。",
+        options: own.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "blossomEvolve": {
+      const cards = topCards(state, side, 3);
+      if (!cards.length) break;
+      const eligible = cards.filter((item) => isBeastCard(item.cardId));
+      state.pending = {
+        kind: "multi",
+        effect: "blossomEvoPick",
+        title: "ブロッサムルナール（EVOLVE）：查看牌頂3張",
+        prompt: "可以將其中1張獸・卡牌置入EX區；其餘以任意順序置於牌庫底。",
+        options: cards.map((item) => ({
+          uid: item.uid,
+          cardId: item.cardId,
+          description: eligible.some((hit) => hit.uid === item.uid) ? undefined : "不符合條件",
+        })),
+        min: 0,
+        max: 1,
+        side,
+        data: { cards, eligible: eligible.map((item) => item.uid) },
+      };
+      break;
+    }
+    case "cuttingEvolve": {
+      const targets = ps(state, side).field.filter((item) =>
+        item.uid !== task.sourceUid && isFollower(item) && (isAcademyCard(item.cardId) || isBeastCard(item.cardId)));
+      if (!targets.length) break;
+      state.pending = {
+        kind: "multi",
+        effect: "cuttingEvoBounce",
+        title: "カッティングキャット（EVOLVE）",
+        prompt: "可以將自己場上其他1體学院或獸・從者返回手牌：對對方1體從者造成3點傷害。也可以不選。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "salviaEvolve": {
+      const targets = ps(state, otherSide(side)).field.filter((item) =>
+        isFollower(item) && definition(baseCardId(item)).cost <= 3);
+      if (!targets.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "salviaEvoBounce",
+        title: "サルビアパンサー（EVOLVE）",
+        prompt: "選擇對方場上1體原本費用3以下的從者，將其返回手牌。衍生卡會從遊戲中移除。",
+        options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "aiAttackCombatResolve":
+      resolveAiAttackCombat(state, task.data?.attackerUid as string, task.data?.targetUid as string);
+      break;
     default:
       break;
   }
@@ -1810,22 +2171,55 @@ function runTasks(state: GameState): void {
   }
 }
 
+/**
+ * 無條件自動折扣（不經 pending）：英雄の覚悟（EX使用-1、場上有セタス-1）、
+ * サルビアパンサー（本回合有「同名除外的獸・從者」從場上回手時-2）。
+ * 回傳 undefined 表示這張卡沒有自動折扣（使用原費）。
+ */
+function autoDiscountedCost(state: GameState, card: CardInstance, zone: Zone, side: Side): number | undefined {
+  if (card.cardId === "heroResolve") {
+    let cost = definition(card).cost;
+    if (zone === "ex") cost -= 1;
+    if (ps(state, side).field.some((item) => isFollower(item) && cardName(baseCardId(item)).includes("セタス"))) cost -= 1;
+    return Math.max(0, cost);
+  }
+  if (card.cardId === "salviaPanther") {
+    const bounced = state.bouncedThisTurn[side].some((cardId) =>
+      cardId !== "salviaPanther" && isBeastCard(cardId) && CARDS[cardId]?.kind === "follower");
+    return bounced ? Math.max(0, definition(card).cost - 2) : undefined;
+  }
+  return undefined;
+}
+
 function playableReason(state: GameState, card: CardInstance, zone: Zone, side: Side): string | undefined {
   if (state.status !== "playing") return "遊戲尚未開始或已結束";
   if (state.turnSide !== side) return "不是這一方的回合";
   if (state.phase !== "main" && !(side === "ai" && state.aiControl === "scripted" && state.phase === "ai")) return "目前不是自己的主階段";
-  const canReduceBrutal = card.cardId === "brutalGeno" && side === "player"
-    && state.player.field.some((item) => isLevinCard(baseCardId(item)) && isFollower(item) && definition(baseCardId(item)).cost <= 3);
-  const requiredPp = canReduceBrutal ? Math.min(1, definition(card).cost) : definition(card).cost;
+  const canReduceBrutal = card.cardId === "brutalGeno"
+    && ps(state, side).field.some((item) => isLevinCard(baseCardId(item)) && isFollower(item) && definition(baseCardId(item)).cost <= 3);
+  const requiredPp = canReduceBrutal
+    ? Math.min(1, definition(card).cost)
+    : autoDiscountedCost(state, card, zone, side) ?? definition(card).cost;
   if (ps(state, side).pp < requiredPp) return "PP不足";
+  if (card.cardId === "sekkaAdvance") return "アドバンス從者不能用一般方式使用";
+  if (card.cardId === "heroResolve") {
+    if (!ps(state, otherSide(side)).field.some(isFollower)) return "對方場上沒有從者";
+    if (!ps(state, side).field.some((item) => isFollower(item) && isBeastCard(item.cardId))) return "自己場上沒有獸・從者";
+  }
+  if (card.cardId === "ninetailResolve") {
+    const mode1 = ps(state, side).field.some((item) => baseCardId(item) === "sekkaAdvance");
+    const mode2 = ps(state, side).field.some((item) => isFollower(item) && cardName(baseCardId(item)).includes("セッカ"))
+      && ps(state, otherSide(side)).field.some(isFollower);
+    if (!mode1 && !mode2) return "沒有可選擇的效果目標";
+  }
   if ((isFollower(card) || isAmulet(card)) && !canFitField(state, side) && !canReduceBrutal) return "場上5格已滿";
   if (card.cardId === "tentacleBite") {
-    if (!state.player.field.some((item) => isLevinCard(item.cardId) && isFollower(item) && !item.tapped)) return "需要1體可橫置的雷維翁・從者作為追加費用";
-    if (!state.ai.field.some(isFollower)) return "對方場上沒有從者";
+    if (!ps(state, side).field.some((item) => isLevinCard(item.cardId) && isFollower(item) && !item.tapped)) return "需要1體可橫置的雷維翁・從者作為追加費用";
+    if (!ps(state, otherSide(side)).field.some(isFollower)) return "對方場上沒有從者";
   }
-  if (card.cardId === "levinJustice" && !state.ai.field.some(isFollower)) return "對方場上沒有合法目標";
+  if (card.cardId === "levinJustice" && !ps(state, otherSide(side)).field.some(isFollower)) return "對方場上沒有合法目標";
   if (zone === "ex" && card.cardId === "miasmaAria") return "這張アリア不能從EX區使用";
-  if (card.cardId === "antiAir" && (!state.player.field.length || !state.ai.field.some(isFollower))) return "需要自己場上1張[エルフ]卡牌與對方1體從者";
+  if (card.cardId === "antiAir" && (!ps(state, side).field.length || !ps(state, otherSide(side)).field.some(isFollower))) return "需要自己場上1張[エルフ]卡牌與對方1體從者";
   if (card.cardId === "returningDissonance") {
     if (!ps(state, side).grave.some((item) => isLishenna(item.cardId))) return "墓場沒有可作追加費用的リーシェナ從者";
     if (idolField(state, side).length < 2) return "場上偶像卡牌不足2張";
@@ -1845,12 +2239,21 @@ function playCardMutable(state: GameState, side: Side, uid: string, zone: Zone, 
   const reason = playableReason(state, owned.card, zone, side);
   // costOverride（降費/追加費用）情境下改用覆寫後的費用檢查PP，其餘限制照舊。
   if (reason && !(opts?.costOverride !== undefined && reason === "PP不足")) return false;
-  const cost = opts?.costOverride ?? definition(owned.card).cost;
+  // 無條件自動折扣（英雄の覚悟／サルビアパンサー）在所有入口一律直接帶入折扣後費用。
+  const cost = opts?.costOverride ?? autoDiscountedCost(state, owned.card, zone, side) ?? definition(owned.card).cost;
   if (ps(state, side).pp < cost) return false;
   const card = removePlayedCard(state, side, zone, uid);
   if (!card) return false;
   ps(state, side).pp -= cost;
   state.playedThisTurn += 1;
+  // 太陽の勇士・セタス：自己的回合每回合1次（各實例分別計），自己使用獸・卡牌時回復1PP。
+  if (isBeastCard(card.cardId)) {
+    for (const cetus of ps(state, side).field.filter((item) => baseCardId(item) === "cetusSun" && !item.flags.cetusPpUsed)) {
+      cetus.flags.cetusPpUsed = true;
+      ps(state, side).pp = Math.min(ps(state, side).maxPP, ps(state, side).pp + 1);
+      addLog(state, "太陽の勇士・セタス回復1PP。 ");
+    }
+  }
   const primary: Task = definition(card).kind === "spell"
     ? { type: "spell", side, sourceUid: card.uid, cardId: card.cardId, label: `${cardName(card.cardId)}的效果`, data: { kicker: opts?.kicker } }
     : { type: "fanfare", side, sourceUid: card.uid, cardId: card.cardId, label: `${cardName(card.cardId)}的入場曲` };
@@ -1860,46 +2263,52 @@ function playCardMutable(state: GameState, side: Side, uid: string, zone: Zone, 
     if (!cardIsToken(card)) ps(state, side).grave.push(card);
   } else {
     putExistingIntoField(state, card, side, false);
+    if (zone === "hand") card.flags.fromHand = true;
   }
   addLog(state, `${side === "player" ? "你" : "破壞巫"}使用${cardName(card.cardId)}（支付${cost}PP）。`);
   addEvent(state, side, "play", { cardId: card.cardId, pp: ps(state, side).pp, detail: `cost=${cost} zone=${zone}${note ? ` ${note}` : ""}` });
 
   const simultaneous: Task[] = [primary];
-  if (side === "player" && (state.playedThisTurn === 3 || state.playedThisTurn === 5)) {
-    for (const tailwind of state.player.field.filter((item) => item.cardId === "tailwindFairy")) {
+  if (state.playedThisTurn === 3 || state.playedThisTurn === 5) {
+    for (const tailwind of ps(state, side).field.filter((item) => item.cardId === "tailwindFairy")) {
       simultaneous.push({
         type: state.playedThisTurn === 3 ? "tailwindHeal" : "tailwindDraw",
-        side: "player",
+        side,
         sourceUid: tailwind.uid,
         label: `${cardName(tailwind.cardId)}的第${state.playedThisTurn}張觸發`,
       });
     }
   }
-  if (side === "player") {
-    if (isFollower(card) && hasKeyword(state, card, "ward")) {
-      state.pending = {
-        kind: "yesNo",
-        effect: "wardOnEntry",
-        title: `${cardName(card.cardId)}：守護`,
-        prompt: "守護從者進場時，可以改為以橫置狀態進場。要現在橫置它嗎？之後仍會處理同時觸發的效果。",
-        options: [{ uid: "yes", label: "以橫置狀態進場" }, { uid: "no", label: "保持直立" }],
-        min: 1,
-        max: 1,
-        data: { sourceUid: card.uid, tasks: simultaneous },
-      };
-    } else setTriggerOrder(state, simultaneous);
-  } else queueFront(state, ...simultaneous);
+  if (isFollower(card) && hasKeyword(state, card, "ward") && (side === "player" || state.aiControl === "manual")) {
+    state.pending = {
+      kind: "yesNo",
+      effect: "wardOnEntry",
+      title: `${cardName(card.cardId)}：守護`,
+      prompt: "守護從者進場時，可以改為以橫置狀態進場。要現在橫置它嗎？之後仍會處理同時觸發的效果。",
+      options: [{ uid: "yes", label: "以橫置狀態進場" }, { uid: "no", label: "保持直立" }],
+      min: 1,
+      max: 1,
+      side,
+      data: { sourceUid: card.uid, tasks: simultaneous },
+    };
+  } else if (side === "player") setTriggerOrder(state, simultaneous);
+  else queueFront(state, ...simultaneous);
   runTasks(state);
   return true;
 }
 
 export function playCard(input: GameState, uid: string, zone: Zone): GameState {
+  return playCardWithPrompts(input, "player", uid, zone);
+}
+
+function playCardWithPrompts(input: GameState, side: Side, uid: string, zone: Zone): GameState {
   const state = clone(input);
   if (state.pending) return state;
-  const owned = findOwned(state, "player", uid);
-  if (owned && owned.zone === zone && !playableReason(state, owned.card, zone, "player")) {
+  const owned = findOwned(state, side, uid);
+  if (owned && owned.zone === zone && !playableReason(state, owned.card, zone, side)) {
     const id = owned.card.cardId;
-    if (id === "levinSisters" && state.player.pp >= 5) {
+    const me = ps(state, side);
+    if (id === "levinSisters" && me.pp >= 5) {
       state.pending = {
         kind: "yesNo",
         effect: "sistersKicker",
@@ -1908,11 +2317,12 @@ export function playCard(input: GameState, uid: string, zone: Zone): GameState {
         options: [{ uid: "yes", label: "費用+4（共5PP）：三姊妹直接進場" }, { uid: "no", label: "維持1PP：找1張加入手牌" }],
         min: 1,
         max: 1,
+        side,
         data: { uid, zone },
       };
       return state;
     }
-    if (id === "levinJustice" && state.player.pp >= 5) {
+    if (id === "levinJustice" && me.pp >= 5) {
       state.pending = {
         kind: "yesNo",
         effect: "justiceKicker",
@@ -1921,6 +2331,7 @@ export function playCard(input: GameState, uid: string, zone: Zone): GameState {
         options: [{ uid: "no", label: "維持3PP" }, { uid: "yes", label: "費用+2（共5PP）" }],
         min: 1,
         max: 1,
+        side,
         data: { uid, zone },
       };
       return state;
@@ -1931,20 +2342,21 @@ export function playCard(input: GameState, uid: string, zone: Zone): GameState {
         effect: "tentacleActCost",
         title: "テンタクルバイト",
         prompt: "選擇1體要橫置的雷維翁・從者作為追加費用。",
-        options: state.player.field
+        options: me.field
           .filter((item) => isLevinCard(item.cardId) && isFollower(item) && !item.tapped)
           .map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
         data: { uid, zone },
       };
       return state;
     }
     if (id === "brutalGeno") {
-      const sacrifices = state.player.field.filter((item) => isLevinCard(baseCardId(item)) && isFollower(item) && definition(baseCardId(item)).cost <= 3);
+      const sacrifices = me.field.filter((item) => isLevinCard(baseCardId(item)) && isFollower(item) && definition(baseCardId(item)).cost <= 3);
       if (sacrifices.length) {
         const options: ChoiceOption[] = sacrifices.map((item) => ({ uid: item.uid, cardId: item.cardId }));
-        if (state.player.pp >= 4 && canFitField(state, "player")) options.push({ uid: "full", label: "不犧牲，支付全額4PP" });
+        if (me.pp >= 4 && canFitField(state, side)) options.push({ uid: "full", label: "不犧牲，支付全額4PP" });
         state.pending = {
           kind: "single",
           effect: "brutalGenoPlay",
@@ -1953,45 +2365,45 @@ export function playCard(input: GameState, uid: string, zone: Zone): GameState {
           options,
           min: 1,
           max: 1,
+          side,
           data: { uid, zone },
         };
         return state;
       }
     }
   }
-  playCardMutable(state, "player", uid, zone);
-  runTasks(state);
-  return state;
-}
-
-/** 雙策略訓練用；player 仍走原本含追加費用提示的互動入口。 */
-export function playCardForSide(input: GameState, side: Side, uid: string, zone: Zone): GameState {
-  if (side === "player") return playCard(input, uid, zone);
-  const state = clone(input);
-  if (state.aiControl !== "manual" || state.pending) return state;
   playCardMutable(state, side, uid, zone);
   runTasks(state);
   return state;
 }
 
+/** 雙策略訓練用；兩側都走含追加費用提示的互動入口（ai 槽需為 manual）。 */
+export function playCardForSide(input: GameState, side: Side, uid: string, zone: Zone): GameState {
+  if (side === "player") return playCard(input, uid, zone);
+  if (input.aiControl !== "manual") return clone(input);
+  return playCardWithPrompts(input, side, uid, zone);
+}
+
 function resolveSpell(state: GameState, task: Task): void {
   const cardId = task.cardId;
   const side = task.side ?? "player";
+  const enemy = otherSide(side);
   if (!cardId) return;
-  if (side === "player" && cardId === "antiAir") {
+  if (cardId === "antiAir") {
     state.pending = {
       kind: "single",
       effect: "antiAirOwn",
       title: "対空射撃",
       prompt: "先選擇要返回手牌的自己場上[エルフ]卡牌。衍生卡會從遊戲中移除。",
-      options: state.player.field.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      options: ps(state, side).field.map((item) => ({ uid: item.uid, cardId: item.cardId })),
       min: 1,
       max: 1,
+      side,
     };
     return;
   }
-  if (side === "player" && cardId === "tentacleBite") {
-    const targets = state.ai.field.filter(isFollower);
+  if (cardId === "tentacleBite") {
+    const targets = ps(state, enemy).field.filter(isFollower);
     if (!targets.length) return;
     state.pending = {
       kind: "single",
@@ -2001,19 +2413,20 @@ function resolveSpell(state: GameState, task: Task): void {
       options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
       min: 1,
       max: 1,
+      side,
     };
     return;
   }
-  if (side === "player" && cardId === "levinSisters") {
+  if (cardId === "levinSisters") {
     const names = ["levinMaim", "levinMiim", "levinMeim"];
     if (task.data?.kicker) {
       const candidates = names
-        .map((id) => searchDeckInstances(state, "player", (item) => item.cardId === id)[0])
+        .map((id) => searchDeckInstances(state, side, (item) => item.cardId === id)[0])
         .filter(Boolean) as CardInstance[];
-      const capacity = Math.max(0, 5 - state.player.field.length);
+      const capacity = Math.max(0, 5 - ps(state, side).field.length);
       if (!candidates.length || capacity === 0) {
         addLog(state, !candidates.length ? "牌庫中找不到任何一位姊妹（可以檢索失敗）。" : "場上已滿，可以讓三姊妹的檢索全部落空。");
-        shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
+        shuffleAfterSearch(state, side, "レヴィオンシスターズ登場！");
         return;
       }
       state.pending = {
@@ -2024,15 +2437,16 @@ function resolveSpell(state: GameState, task: Task): void {
         options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 0,
         max: Math.min(3, capacity, candidates.length),
+        side,
       };
       return;
     }
     const candidates = names
-      .map((id) => searchDeckInstances(state, "player", (item) => item.cardId === id)[0])
+      .map((id) => searchDeckInstances(state, side, (item) => item.cardId === id)[0])
       .filter(Boolean) as CardInstance[];
     if (!candidates.length) {
       addLog(state, "牌庫中找不到任何一位姊妹（可以檢索失敗）。");
-      shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
+      shuffleAfterSearch(state, side, "レヴィオンシスターズ登場！");
       return;
     }
     state.pending = {
@@ -2043,11 +2457,12 @@ function resolveSpell(state: GameState, task: Task): void {
       options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
       min: 0,
       max: 1,
+      side,
     };
     return;
   }
-  if (side === "player" && cardId === "levinJustice") {
-    const targets = state.ai.field.filter(isFollower);
+  if (cardId === "levinJustice") {
+    const targets = ps(state, enemy).field.filter(isFollower);
     if (targets.length) {
       state.pending = {
         kind: "single",
@@ -2057,9 +2472,72 @@ function resolveSpell(state: GameState, task: Task): void {
         options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
         data: { kicker: task.data?.kicker },
       };
     }
+    return;
+  }
+  if (cardId === "ninetailResolve") {
+    const options: ChoiceOption[] = [];
+    if (ps(state, side).field.some((item) => baseCardId(item) === "sekkaAdvance")) {
+      options.push({ uid: "mode1", label: "①九火石炎・セッカ：消滅領域9張以上時+2/+2並獲得【疾走】" });
+    }
+    if (ps(state, side).field.some((item) => isFollower(item) && cardName(baseCardId(item)).includes("セッカ"))
+      && ps(state, enemy).field.some(isFollower)) {
+      options.push({ uid: "mode2", label: "②セッカ從者+2/+2，之後對對方1體從者造成其攻擊力的傷害" });
+    }
+    if (!options.length) return;
+    state.pending = {
+      kind: "multi",
+      effect: "ninetailModes",
+      title: "九尾の決意",
+      prompt: "從下列選擇最多2項，依①②順序結算。",
+      options,
+      min: 1,
+      max: Math.min(2, options.length),
+      side,
+    };
+    return;
+  }
+  if (cardId === "heroResolve") {
+    const targets = ps(state, enemy).field.filter(isFollower);
+    if (!targets.length) return;
+    state.pending = {
+      kind: "single",
+      effect: "heroResolveEnemy",
+      title: "英雄の覚悟",
+      prompt: "選擇要受到4點傷害的對方從者；之後選擇自己場上1體要+1/+1的獸・從者。",
+      options: targets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      min: 1,
+      max: 1,
+      side,
+    };
+    return;
+  }
+  if (cardId === "greenManifest") {
+    const cards = topCards(state, side, 7);
+    if (!cards.length) {
+      queueFront(state, { type: "greenBuff", side, label: "緑の顕現的全體強化" });
+      return;
+    }
+    const eligible = cards.filter((item) => isFollower(item) && (isAcademyCard(item.cardId) || isBeastCard(item.cardId)));
+    const capacity = Math.max(0, 5 - ps(state, side).field.length);
+    state.pending = {
+      kind: "multi",
+      effect: "greenManifestPick",
+      title: "緑の顕現",
+      prompt: "查看牌頂7張。可以將最多3張「原本費用合計5以下」的学院或獸・從者放置到場上；其餘置於牌庫底。",
+      options: cards.map((item) => ({
+        uid: item.uid,
+        cardId: item.cardId,
+        description: eligible.some((hit) => hit.uid === item.uid) ? undefined : "不符合條件",
+      })),
+      min: 0,
+      max: Math.min(3, capacity, eligible.length),
+      side,
+      data: { cards, eligible: eligible.map((item) => item.uid), maxTotalCost: 5 },
+    };
     return;
   }
   if (side !== "ai") return;
@@ -2187,6 +2665,7 @@ function canEvolve(state: GameState, side: Side, card: CardInstance, payment: "p
   if (state.evolvedThisTurn) return "本回合已經進化過";
   if (!def.evolveId || def.evolveCost === undefined) return "這張卡不能進化";
   if ((ps(state, side).evolveRemaining[def.evolveId] ?? 0) <= 0) return "進化區沒有對應卡";
+  if (card.cardId === "swordRabbit" && !state.bouncedThisTurn[side].length) return "本回合沒有自己的卡從場上回到手牌";
   const evolveCost = card.flags.freeEvolve ? 0 : def.evolveCost;
   const ppCost = Math.max(0, evolveCost - (payment === "ep" ? 1 : 0));
   if (payment === "ep" && ps(state, side).ep <= 0) return "沒有EP";
@@ -2231,6 +2710,9 @@ function evolveMutable(state: GameState, side: Side, uid: string, payment: "pp" 
   if (evolveId === "destructionServantEvo") tasks.push({ type: "servantEvolve", side, sourceUid: uid, label: "破壊の従者的進化時" });
   if (evolveId === "axiaEvo") tasks.push({ type: "axiaEvolve", side, sourceUid: uid, data: { superEvolve }, label: "アクシア的進化時" });
   if (evolveId === "destructiveLishennaEvo") tasks.push({ type: "lishennaEvolve", side, sourceUid: uid, label: "奏絶の破壊・リーシェナ的進化時" });
+  if (evolveId === "blossomLunarEvo") tasks.push({ type: "blossomEvolve", side, sourceUid: uid, label: "ブロッサムルナール的進化時" });
+  if (evolveId === "cuttingCatEvo") tasks.push({ type: "cuttingEvolve", side, sourceUid: uid, label: "カッティングキャット的進化時" });
+  if (evolveId === "salviaPantherEvo") tasks.push({ type: "salviaEvolve", side, sourceUid: uid, label: "サルビアパンサー的進化時" });
   if (superEvolve && evolveId === "naturalAriaEvo") tasks.push({ type: "naturalAriaSuper", side, sourceUid: uid, label: "自然の妖精姫・アリア的超進化時" });
   if (side === "player") setTriggerOrder(state, tasks);
   else queueFront(state, ...tasks);
@@ -2278,12 +2760,21 @@ function setBottomOrder(state: GameState, side: Side, cards: CardInstance[]): vo
   };
 }
 
+/** 記錄「場→手」事件（含被移除的衍生卡名），並掛上ソードラビット的回手觸發。 */
+function recordFieldBounce(state: GameState, owner: Side, cardId: string, reachedHand: boolean): void {
+  state.bouncedThisTurn[owner].push(cardId);
+  if (reachedHand && cardId === "swordRabbit") {
+    queueFront(state, { type: "rabbitReturn", side: owner, label: "ソードラビット的回手觸發" });
+  }
+}
+
 function bounceFollower(state: GameState, target: CardInstance): void {
   const owner = target.owner;
   if (!removeFromZone(ps(state, owner), "field", target.uid)) return;
   const id = baseCardId(target);
   cleanupEvolveCard(state, target);
   if (definition(id).token) {
+    recordFieldBounce(state, owner, id, false);
     addLog(state, `${cardName(id)}返回手牌時，因為是衍生卡而從遊戲中移除。`);
     return;
   }
@@ -2293,6 +2784,7 @@ function bounceFollower(state: GameState, target: CardInstance): void {
   target.healthBuff = 0;
   target.tapped = false;
   ps(state, owner).hand.push(target);
+  recordFieldBounce(state, owner, id, true);
   addLog(state, `${cardName(id)}回到手牌。`);
 }
 
@@ -2302,7 +2794,7 @@ function resolveAttackMutable(state: GameState, attackerUid: string, targetUid: 
   const legal = attackTargets(state, attacker).map((item) => item.uid);
   if (!legal.includes(targetUid)) return;
   attacker.tapped = true;
-  if (attacker.cardId === "levinMeim" && graveLevin(state) >= 5) {
+  if (attacker.cardId === "levinMeim" && graveLevin(state, attacker.owner) >= 5) {
     attacker.attackBuff += 2;
     attacker.healthBuff += 1;
     addLog(state, "メイム的【攻擊時】：+2/+1。 ");
@@ -2338,9 +2830,38 @@ function resolveAttackMutable(state: GameState, attackerUid: string, targetUid: 
   resolvePlayerAttackCombat(state, attackerUid, targetUid);
 }
 
+/**
+ * タイガーガール【攻擊時】：攻擊宣告後、戰鬥結算前的可選 pending。
+ * 每個攻擊實例只問一次（flags.tigerStrikeChecked，回合開始清除）；
+ * 選擇後戰鬥照常結算（目標已死亡則打空、攻擊者維持橫置）。
+ */
+function maybeTigerGirlStrike(state: GameState, side: Side, attackerUid: string, targetUid: string): boolean {
+  const attacker = ps(state, side).field.find((item) => item.uid === attackerUid);
+  if (!attacker || baseCardId(attacker) !== "tigerGirl" || attacker.flags.tigerStrikeChecked) return false;
+  const enemyTargets = ps(state, otherSide(side)).field.filter(isFollower);
+  if (graveBeastCards(state, side).length < 3 || !enemyTargets.length) return false;
+  attacker.flags.tigerStrikeChecked = true;
+  state.pending = {
+    kind: "single",
+    effect: "tigerGirlStrike",
+    title: "タイガーガール【攻擊時】",
+    prompt: "可以消滅自己墓場3張獸・卡牌：對對方1體從者造成4點傷害。也可以不發動，直接結算戰鬥。",
+    options: [
+      ...enemyTargets.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      { uid: "pass", label: "不發動，直接結算戰鬥" },
+    ],
+    min: 1,
+    max: 1,
+    side,
+    data: { side, attackerUid, targetUid },
+  };
+  return true;
+}
+
 function resolvePlayerAttackCombat(state: GameState, attackerUid: string, targetUid: string): void {
   const attacker = state.player.field.find((item) => item.uid === attackerUid);
   if (!attacker || state.status === "gameover") return;
+  if (maybeTigerGirlStrike(state, "player", attackerUid, targetUid)) return;
   if (targetUid === "ai-leader") {
     damageLeader(state, "ai", attackOf(attacker));
     return;
@@ -2349,9 +2870,9 @@ function resolvePlayerAttackCombat(state: GameState, attackerUid: string, target
   if (!target) return;
   const attackerDamage = attackOf(target);
   const targetDamage = attackOf(attacker);
-  dealDamageToFollower(state, target, targetDamage, "交戰");
+  dealDamageToFollower(state, target, targetDamage, "交戰", "combat");
   const stillAttacker = state.player.field.find((item) => item.uid === attackerUid);
-  if (stillAttacker) dealDamageToFollower(state, stillAttacker, attackerDamage, "交戰");
+  if (stillAttacker) dealDamageToFollower(state, stillAttacker, attackerDamage, "交戰", "combat");
 }
 
 function canAttackNow(state: GameState, card: CardInstance): boolean {
@@ -2370,40 +2891,53 @@ export function attackTargets(state: GameState, attacker: CardInstance): ChoiceO
   const canFace = survived || hasKeyword(state, attacker, "storm");
   const canHitStand = hasKeyword(state, attacker, "designated");
   const targets = opponent.field.filter((item) =>
-    isFollower(item) && (item.tapped || canHitStand) && !(attacker.owner === "ai" && item.flags.intimidate));
+    isFollower(item) && (item.tapped || canHitStand) && !item.flags.intimidate);
   const options: ChoiceOption[] = targets.map((item) => ({ uid: item.uid, cardId: item.cardId }));
   if (canFace) options.unshift({ uid: `${otherSide(attacker.owner)}-leader`, label: otherSide(attacker.owner) === "ai" ? "破壞巫主戰者" : "你的主戰者" });
   return options;
 }
 
-function canActivate(state: GameState, card: CardInstance, actionId: string): string | undefined {
-  if (state.turnSide !== "player" || state.phase !== "main") return "只能在自己的主階段使用";
+function canActivate(state: GameState, card: CardInstance, actionId: string, side: Side = "player"): string | undefined {
+  const enemy = otherSide(side);
+  if (state.turnSide !== side || state.phase !== "main") return "只能在自己的主階段使用";
   if (actionId === "albertRestand") {
     if (!card.tapped) return "此卡已經直立";
-    if (state.player.pp < 3) return "需要3PP";
-    if (graveRoyalFollowers(state) < 10) return "墓場[ロイヤル]從者不足10張";
+    if (ps(state, side).pp < 3) return "需要3PP";
+    if (graveRoyalFollowers(state, side) < 10) return "墓場[ロイヤル]從者不足10張";
     if (card.flags.albertRestandUsed) return "本回合已使用過";
     return undefined;
   }
+  if (actionId === "sekkaIgnite") {
+    if (ps(state, side).pp < 3) return "需要3PP";
+    if (ps(state, side).grave.filter((item) => item.uid !== card.uid).length < 2) return "墓場沒有另外2張可消滅的卡牌";
+    if ((ps(state, side).evolveRemaining.sekkaAdvance ?? 0) <= 0) return "進化區沒有『九火石炎・セッカ』";
+    if (!canFitField(state, side)) return "場上5格已滿";
+    return undefined;
+  }
   if (card.tapped) return "卡片已經橫置";
-  if (actionId === "dukePing" && !state.ai.field.some(isFollower)) return "對方沒有從者";
+  if (actionId === "cheshireCounters") {
+    const targets = [...ps(state, side).field, ...ps(state, side).ex]
+      .filter((item) => item.uid !== card.uid && isFollower(item) && isFairyTaleCard(item.cardId));
+    if (!targets.length) return "場上或EX區沒有其他童話・從者";
+  }
+  if (actionId === "dukePing" && !ps(state, enemy).field.some(isFollower)) return "對方沒有從者";
   if (actionId === "archerSnipe") {
-    if (!state.ai.field.some(isFollower)) return "對方沒有從者";
+    if (!ps(state, enemy).field.some(isFollower)) return "對方沒有從者";
   }
   if (actionId === "amatsuStorm") {
-    const candidates = state.player.field.filter((item) => item.uid !== card.uid && isFollower(item) && isFairyCard(item.cardId) && definition(item).cost <= 1);
+    const candidates = ps(state, side).field.filter((item) => item.uid !== card.uid && isFollower(item) && isFairyCard(item.cardId) && definition(item).cost <= 1);
     if (!candidates.length) return "場上沒有原費用1以下的妖精從者";
   }
   if (actionId === "bouquetBounce") {
-    if (!state.player.ex.length) return "EX區沒有可消滅的卡";
-    if (!state.ai.field.some(isFollower)) return "對方沒有從者";
+    if (!ps(state, side).ex.length) return "EX區沒有可消滅的卡";
+    if (!ps(state, enemy).field.some(isFollower)) return "對方沒有從者";
   }
-  if (actionId === "gardenDamage" && !state.ai.field.some(isFollower)) return "對方沒有從者";
-  if (actionId === "wonderDraw" && exFairyFollowers(state).length < 3) return "EX區妖精從者不足3張";
+  if (actionId === "gardenDamage" && !ps(state, enemy).field.some(isFollower)) return "對方沒有從者";
+  if (actionId === "wonderDraw" && exFairyFollowers(state, side).length < 3) return "EX區妖精從者不足3張";
   if (actionId === "wingDestroy") {
-    if (state.player.pp < 1) return "需要1PP";
-    if (exFairyCards(state).length !== 5) return "EX區妖精卡必須正好5張";
-    if (!state.ai.field.some(isFollower)) return "對方沒有從者";
+    if (ps(state, side).pp < 1) return "需要1PP";
+    if (exFairyCards(state, side).length !== 5) return "EX區妖精卡必須正好5張";
+    if (!ps(state, enemy).field.some(isFollower)) return "對方沒有從者";
   }
   return undefined;
 }
@@ -2416,6 +2950,13 @@ export function cardActions(state: GameState, uid: string, zone: Zone, side: Sid
   if ((zone === "hand" || zone === "ex") && (side === "player" || state.aiControl === "manual")) {
     const reason = playableReason(state, card, zone, side);
     actions.push({ id: "play", label: "出場／使用", enabled: !reason, reason });
+  }
+  if (zone === "grave" && (side === "player" || state.aiControl === "manual")) {
+    if (card.cardId === "foxfireSekka") {
+      const reason = canActivate(state, card, "sekkaIgnite", side);
+      actions.push({ id: "sekkaIgnite", label: "3PP＋消滅此卡與墓場另2張卡：放置『九火石炎・セッカ』", enabled: !reason, reason });
+    }
+    return actions;
   }
   if (zone !== "field" || (side === "ai" && state.aiControl !== "manual")) return actions;
   const targets = attackTargets(state, card);
@@ -2434,7 +2975,7 @@ export function cardActions(state: GameState, uid: string, zone: Zone, side: Sid
       actions.push({ id: "super-ep", label: "以EP＋SEP超進化", enabled: !sep, reason: sep, payment: "ep", superEvolve: true });
     }
   }
-  const actByCard: Record<string, [string, string]> = side === "player" ? {
+  const actByCard: Record<string, [string, string]> = {
     fairyBladeAmatsu: ["amatsuStorm", "橫置：給最多2體妖精疾走"],
     bouquetFairy: ["bouquetBounce", "橫置＋消滅EX：敵方從者返回手牌"],
     riotousGarden: ["gardenDamage", "橫置＋置入墓場：造成妖精數量傷害"],
@@ -2443,21 +2984,25 @@ export function cardActions(state: GameState, uid: string, zone: Zone, side: Sid
     levinDuke: ["dukePing", "橫置：對敵方從者造成1點傷害"],
     levinArcher: ["archerSnipe", "橫置：若墓場雷維翁5+，造成3點傷害"],
     levinAlbert: ["albertRestand", "3PP：使此卡直立（墓場ロイヤル從者10+，每回合1次）"],
-  } : {};
+    cheshireCat: ["cheshireCounters", "橫置＋置於牌庫底：放置2個童話指示物"],
+  };
   const activation = actByCard[baseCardId(card)] ?? actByCard[card.cardId];
   if (activation) {
-    const reason = canActivate(state, card, activation[0]);
+    const reason = canActivate(state, card, activation[0], side);
     actions.push({ id: activation[0], label: activation[1], enabled: !reason, reason });
   }
   return actions;
 }
 
-export function activateFieldCard(input: GameState, uid: string, actionId: string): GameState {
+export function activateFieldCard(input: GameState, uid: string, actionId: string, side: Side = "player"): GameState {
   const state = clone(input);
   if (state.pending) return state;
-  const source = state.player.field.find((item) => item.uid === uid);
-  if (!source || canActivate(state, source, actionId)) return state;
+  const enemy = otherSide(side);
+  const source = ps(state, side).field.find((item) => item.uid === uid)
+    ?? (actionId === "sekkaIgnite" ? ps(state, side).grave.find((item) => item.uid === uid && item.cardId === "foxfireSekka") : undefined);
+  if (!source || canActivate(state, source, actionId, side)) return state;
   if (actionId === "attack") {
+    if (side !== "player") return state;
     const options = attackTargets(state, source);
     state.pending = {
       kind: "single",
@@ -2470,7 +3015,7 @@ export function activateFieldCard(input: GameState, uid: string, actionId: strin
       data: { sourceUid: uid },
     };
   } else if (actionId === "amatsuStorm") {
-    const options = state.player.field
+    const options = ps(state, side).field
       .filter((item) => item.uid !== uid && isFollower(item) && isFairyCard(item.cardId) && definition(item).cost <= 1)
       .map((item) => ({ uid: item.uid, cardId: item.cardId }));
     state.pending = {
@@ -2481,6 +3026,7 @@ export function activateFieldCard(input: GameState, uid: string, actionId: strin
       options,
       min: 0,
       max: Math.min(2, options.length),
+      side,
       data: { sourceUid: uid },
     };
   } else if (actionId === "bouquetBounce") {
@@ -2489,9 +3035,10 @@ export function activateFieldCard(input: GameState, uid: string, actionId: strin
       effect: "bouquetExCost",
       title: "花束の妖精",
       prompt: "先選擇要從EX區消滅的1張卡。",
-      options: state.player.ex.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      options: ps(state, side).ex.map((item) => ({ uid: item.uid, cardId: item.cardId })),
       min: 1,
       max: 1,
+      side,
       data: { sourceUid: uid },
     };
   } else if (actionId === "gardenDamage" || actionId === "wingDestroy") {
@@ -2500,16 +3047,17 @@ export function activateFieldCard(input: GameState, uid: string, actionId: strin
       effect: actionId === "gardenDamage" ? "gardenTarget" : "wingDestroyTarget",
       title: cardName(source.cardId),
       prompt: "選擇對方1體從者。確認後支付起動能力的全部費用。",
-      options: state.ai.field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      options: ps(state, enemy).field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
       min: 1,
       max: 1,
+      side,
       data: { sourceUid: uid },
     };
   } else if (actionId === "wonderDraw") {
     source.tapped = true;
-    addEvent(state, "player", "activate", { cardId: "wonderTree" });
+    addEvent(state, side, "activate", { cardId: "wonderTree" });
     moveFieldToGrave(state, source, "ワンダーツリー起動費用");
-    drawCards(state, "player", 2);
+    drawCards(state, side, 2);
     addLog(state, "ワンダーツリー使你抽2張。 ");
   } else if (actionId === "dukePing" || actionId === "archerSnipe") {
     state.pending = {
@@ -2517,17 +3065,46 @@ export function activateFieldCard(input: GameState, uid: string, actionId: strin
       effect: actionId === "dukePing" ? "dukeTarget" : "archerTarget",
       title: cardName(source.cardId),
       prompt: actionId === "dukePing" ? "選擇要受到1點傷害的對方從者。" : "選擇對方1體從者。結算時若墓場雷維翁卡牌為5張以上，對其造成3點傷害；未達5張仍會橫置此卡。",
-      options: state.ai.field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      options: ps(state, enemy).field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
       min: 1,
       max: 1,
+      side,
       data: { sourceUid: uid },
     };
   } else if (actionId === "albertRestand") {
-    state.player.pp -= 3;
+    ps(state, side).pp -= 3;
     source.tapped = false;
     source.flags.albertRestandUsed = true;
-    addEvent(state, "player", "activate", { cardId: "levinAlbert", detail: "restand" });
+    addEvent(state, side, "activate", { cardId: "levinAlbert", detail: "restand" });
     addLog(state, "アルベール支付3PP重新直立，可以再次攻擊。 ");
+  } else if (actionId === "sekkaIgnite") {
+    state.pending = {
+      kind: "multi",
+      effect: "sekkaIgniteCost",
+      title: "宿命の狐火・セッカ（墓場起動）",
+      prompt: "選擇墓場中另外2張要一併消滅的卡牌。確認後支付3PP，將『九火石炎・セッカ』放置到場上。",
+      options: ps(state, side).grave
+        .filter((item) => item.uid !== uid)
+        .map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      min: 2,
+      max: 2,
+      side,
+      data: { sourceUid: uid },
+    };
+  } else if (actionId === "cheshireCounters") {
+    state.pending = {
+      kind: "single",
+      effect: "cheshireCounterTarget",
+      title: "チェシャキャット",
+      prompt: "選擇自己場上或EX區1體童話・從者，放置2個童話指示物。確認後此卡橫置並置於牌庫底。",
+      options: [...ps(state, side).field, ...ps(state, side).ex]
+        .filter((item) => item.uid !== uid && isFollower(item) && isFairyTaleCard(item.cardId))
+        .map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      min: 1,
+      max: 1,
+      side,
+      data: { sourceUid: uid },
+    };
   }
   runTasks(state);
   return state;
@@ -2546,6 +3123,15 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
   if (!pending) return state;
   const picked = normalizedSelection(pending, selected);
   if (picked.length < pending.min || picked.length > pending.max) return state;
+  // 通用組合約束：pending.data.maxTotalCost 限制所選卡牌的原本費用合計（緑の顕現等）。
+  const maxTotalCost = pending.data?.maxTotalCost as number | undefined;
+  if (maxTotalCost !== undefined) {
+    const totalCost = picked.reduce((sum, uid) => {
+      const option = pending.options.find((item) => item.uid === uid);
+      return sum + (option?.cardId ? CARDS[option.cardId].cost : 0);
+    }, 0);
+    if (totalCost > maxTotalCost) return state;
+  }
   delete state.pending;
 
   switch (pending.effect) {
@@ -2558,13 +3144,14 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       break;
     }
     case "wardOnEntry": {
-      const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
       if (picked[0] === "yes" && source && hasKeyword(state, source, "ward")) {
         source.tapped = true;
         addLog(state, `${cardName(source.cardId)}以橫置狀態進場，守護生效。`);
       }
       const tasks = (pending.data?.tasks as Task[]) ?? [];
-      if (tasks.length) setTriggerOrder(state, tasks);
+      if (tasks.length) setTriggerOrder(state, tasks, side);
       break;
     }
     case "addExSubset": {
@@ -2576,6 +3163,7 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       break;
     }
     case "fairyArcherPick": {
+      const side = pending.side ?? "player";
       const cards = (pending.data?.cards as CardInstance[]) ?? [];
       const eligible = new Set((pending.data?.eligible as string[]) ?? []);
       const chosenUid = picked.find((uid) => eligible.has(uid));
@@ -2583,12 +3171,12 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
         const card = cards.find((item) => item.uid === chosenUid);
         if (card) {
           card.zone = "hand";
-          state.player.hand.push(card);
+          ps(state, side).hand.push(card);
           cards.splice(cards.findIndex((item) => item.uid === card.uid), 1);
           addLog(state, `妖精の弓使い將${cardName(card.cardId)}加入手牌。`);
         }
       }
-      setBottomOrder(state, "player", cards);
+      setBottomOrder(state, side, cards);
       break;
     }
     case "bottomOrder": {
@@ -2799,123 +3387,138 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
     }
     case "wingQueenTutor":
     case "miasmaAmuletTutor": {
-      const card = removeDeckInstance(state, "player", picked[0]);
+      const side = pending.side ?? "player";
+      const card = removeDeckInstance(state, side, picked[0]);
       if (card) {
-        putExistingIntoField(state, card, "player", true);
+        putExistingIntoField(state, card, side, true);
         addLog(state, `${pending.effect === "wingQueenTutor" ? "翅の女王・ティターニア" : "瘴気の妖精姫・アリア"}將${cardName(card.cardId)}從牌庫放到場上。`);
       }
       break;
     }
     case "miasmaLastWord": {
-      if (picked[0] === "yes" && state.player.ex.length < 5) {
+      const side = pending.side ?? "player";
+      if (picked[0] === "yes" && ps(state, side).ex.length < 5) {
         const uid = pending.data?.sourceUid as string;
-        const card = removeFromZone(state.player, "grave", uid);
+        const card = removeFromZone(ps(state, side), "grave", uid);
         if (card) {
           card.zone = "ex";
-          state.player.ex.push(card);
+          ps(state, side).ex.push(card);
           addLog(state, "瘴気の妖精姫・アリア由墓場移到EX區。 ");
         }
       }
       break;
     }
     case "antiAirOwn": {
-      const own = state.player.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const own = ps(state, side).field.find((item) => item.uid === picked[0]);
       if (!own) break;
-      removeFromZone(state.player, "field", own.uid);
+      removeFromZone(ps(state, side), "field", own.uid);
       const id = baseCardId(own);
       cleanupEvolveCard(state, own);
-      if (definition(id).token) addLog(state, `${cardName(id)}因対空射撃回手而移除遊戲。`);
-      else {
+      if (definition(id).token) {
+        recordFieldBounce(state, side, id, false);
+        addLog(state, `${cardName(id)}因対空射撃回手而移除遊戲。`);
+      } else {
         own.zone = "hand";
         own.damage = 0;
         own.attackBuff = 0;
         own.healthBuff = 0;
         own.tapped = false;
-        state.player.hand.push(own);
+        ps(state, side).hand.push(own);
+        recordFieldBounce(state, side, id, true);
       }
       state.pending = {
         kind: "single",
         effect: "antiAirEnemy",
         title: "対空射撃",
         prompt: "選擇要受到3點傷害的對方從者。",
-        options: state.ai.field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        options: ps(state, otherSide(side)).field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
       };
       break;
     }
     case "antiAirEnemy": {
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (target) dealDamageToFollower(state, target, 3, "対空射撃");
       break;
     }
     case "reverseEvolveTarget": {
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
-      if (target && state.player.ex.length >= 3) destroyFollower(state, target, "リバースブレイダー・アマツ");
-      if (exFairyCards(state).length >= 3) damageLeader(state, "ai", 2);
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+      if (target && ps(state, side).ex.length >= 3) destroyFollower(state, target, "リバースブレイダー・アマツ");
+      if (exFairyCards(state, side).length >= 3) damageLeader(state, otherSide(side), 2);
       break;
     }
     case "amatsuTargets": {
-      const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
       if (!source || source.tapped) break;
       source.tapped = true;
       for (const uid of picked) {
-        const target = state.player.field.find((item) => item.uid === uid);
+        const target = ps(state, side).field.find((item) => item.uid === uid);
         if (target) target.tempStorm = true;
       }
       addLog(state, `フェアリーブレイダー・アマツ給${picked.length}體妖精疾走。`);
-      addEvent(state, "player", "activate", { cardId: "fairyBladeAmatsu", detail: `storm=${picked.length}` });
+      addEvent(state, side, "activate", { cardId: "fairyBladeAmatsu", detail: `storm=${picked.length}` });
       break;
     }
     case "bouquetExCost": {
+      const side = pending.side ?? "player";
       const sourceUid = pending.data?.sourceUid as string;
-      const card = state.player.ex.find((item) => item.uid === picked[0]);
+      const card = ps(state, side).ex.find((item) => item.uid === picked[0]);
       if (!card) break;
-      moveCardToBanished(state, "player", card, "ex");
+      moveCardToBanished(state, side, card, "ex");
       state.pending = {
         kind: "single",
         effect: "bouquetTarget",
         title: "花束の妖精",
         prompt: "選擇要回到手牌的對方從者。",
-        options: state.ai.field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        options: ps(state, otherSide(side)).field.filter(isFollower).map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 1,
         max: 1,
+        side,
         data: { sourceUid },
       };
       break;
     }
     case "bouquetTarget": {
-      const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (source && target) {
         source.tapped = true;
-        addEvent(state, "player", "activate", { cardId: "bouquetFairy", detail: `bounce=${target.cardId}` });
+        addEvent(state, side, "activate", { cardId: "bouquetFairy", detail: `bounce=${target.cardId}` });
         bounceFollower(state, target);
       }
       break;
     }
     case "gardenTarget": {
-      const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (source && target) {
         source.tapped = true;
-        addEvent(state, "player", "activate", { cardId: "riotousGarden", detail: `target=${target.cardId}` });
+        addEvent(state, side, "activate", { cardId: "riotousGarden", detail: `target=${target.cardId}` });
         moveFieldToGrave(state, source, "繚乱の庭起動費用");
-        const amount = fieldFairyTokens(state).length + state.player.ex.filter((item) => definition(item).token && isFairyCard(item.cardId) && isFollower(item)).length;
+        const amount = fieldFairyTokens(state, side).length + ps(state, side).ex.filter((item) => definition(item).token && isFairyCard(item.cardId) && isFollower(item)).length;
         dealDamageToFollower(state, target, amount, "繚乱の庭");
       }
       break;
     }
     case "wingDestroyTarget": {
-      const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
-      if (source && target && state.player.pp >= 1 && exFairyCards(state).length === 5) {
-        state.player.pp -= 1;
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+      if (source && target && ps(state, side).pp >= 1 && exFairyCards(state, side).length === 5) {
+        ps(state, side).pp -= 1;
         source.tapped = true;
-        addEvent(state, "player", "activate", { cardId: "wingQueen", detail: `destroy=${target.cardId}` });
+        addEvent(state, side, "activate", { cardId: "wingQueen", detail: `destroy=${target.cardId}` });
         moveFieldToGrave(state, source, "翅の女王・ティターニア起動費用");
         destroyFollower(state, target, "翅の女王・ティターニア");
-        spawnToken(state, "ai", "fairy");
+        spawnToken(state, otherSide(side), "fairy");
       }
       break;
     }
@@ -2924,66 +3527,74 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       break;
     case "sistersKicker":
     case "justiceKicker": {
+      const side = pending.side ?? "player";
       const uid = pending.data?.uid as string;
       const zone = (pending.data?.zone as Zone) ?? "hand";
       const kicker = picked[0] === "yes";
       const extra = pending.effect === "sistersKicker" ? 4 : 2;
-      const card = findOwned(state, "player", uid)?.card;
+      const card = findOwned(state, side, uid)?.card;
       const baseCost = card ? definition(card).cost : 0;
-      playCardMutable(state, "player", uid, zone, undefined, { costOverride: baseCost + (kicker ? extra : 0), kicker });
+      playCardMutable(state, side, uid, zone, undefined, { costOverride: baseCost + (kicker ? extra : 0), kicker });
       break;
     }
     case "tentacleActCost": {
-      const cost = state.player.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const cost = ps(state, side).field.find((item) => item.uid === picked[0]);
       if (!cost || cost.tapped) break;
       cost.tapped = true;
       addLog(state, `你橫置${cardName(cost.cardId)}作為テンタクルバイト的追加費用。`);
-      playCardMutable(state, "player", pending.data?.uid as string, (pending.data?.zone as Zone) ?? "hand");
+      playCardMutable(state, side, pending.data?.uid as string, (pending.data?.zone as Zone) ?? "hand");
       break;
     }
     case "brutalGenoPlay": {
+      const side = pending.side ?? "player";
       if (picked[0] === "full") {
-        playCardMutable(state, "player", pending.data?.uid as string, (pending.data?.zone as Zone) ?? "hand");
+        playCardMutable(state, side, pending.data?.uid as string, (pending.data?.zone as Zone) ?? "hand");
         break;
       }
-      const sacrifice = state.player.field.find((item) => item.uid === picked[0]);
+      const sacrifice = ps(state, side).field.find((item) => item.uid === picked[0]);
       if (!sacrifice) break;
       moveFieldToGrave(state, sacrifice, "暴威の武人・ジェノ的費用");
-      playCardMutable(state, "player", pending.data?.uid as string, (pending.data?.zone as Zone) ?? "hand", undefined, { costOverride: 1 });
+      playCardMutable(state, side, pending.data?.uid as string, (pending.data?.zone as Zone) ?? "hand", undefined, { costOverride: 1 });
       break;
     }
     case "miimDiscard": {
+      const side = pending.side ?? "player";
       if (!picked.length) break;
-      if (discardPlayerCard(state, picked[0], "ミイム的入場曲")) {
-        drawCards(state, "player", 1);
+      if (discardPlayerCard(state, picked[0], "ミイム的入場曲", side)) {
+        drawCards(state, side, 1);
         addLog(state, "ミイム使你抽1張。 ");
       }
       break;
     }
     case "runesDiscard": {
+      const side = pending.side ?? "player";
       if (!picked.length) break;
-      if (discardPlayerCard(state, picked[0], "ルネス的入場曲")) {
-        beginRunesAlbertSearch(state);
+      if (discardPlayerCard(state, picked[0], "ルネス的入場曲", side)) {
+        beginRunesAlbertSearch(state, side);
       }
       break;
     }
     case "runesAlbertPick": {
-      const card = picked.length ? removeDeckInstance(state, "player", picked[0]) : undefined;
+      const side = pending.side ?? "player";
+      const card = picked.length ? removeDeckInstance(state, side, picked[0]) : undefined;
       if (card && isAlbert(card.cardId)) {
         card.zone = "hand";
-        state.player.hand.push(card);
+        ps(state, side).hand.push(card);
         addLog(state, `ルネス將${cardName(card.cardId)}加入手牌。`);
       } else addLog(state, "你選擇讓ルネス的檢索落空。");
-      shuffleAfterSearch(state, "player", "ルネス");
+      shuffleAfterSearch(state, side, "ルネス");
       break;
     }
     case "genoDigPick": {
-      const top = state.player.deck[state.player.deck.length - 1];
+      const side = pending.side ?? "player";
+      const deck = ps(state, side).deck;
+      const top = deck[deck.length - 1];
       const expectedUid = pending.data?.topUid as string | undefined;
       if (picked.length && top?.uid === expectedUid && picked[0] === expectedUid && isLevinCard(top.cardId)) {
-        state.player.deck.pop();
+        deck.pop();
         top.zone = "hand";
-        state.player.hand.push(top);
+        ps(state, side).hand.push(top);
         addLog(state, `ジェノ的捨棄能力：公開牌庫頂的${cardName(top.cardId)}並加入手牌。`);
       } else if (top?.uid === expectedUid) {
         addLog(state, `ジェノ查看牌庫頂的${cardName(top.cardId)}後，讓它留在牌庫頂。`);
@@ -2991,33 +3602,36 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       break;
     }
     case "maimTarget": {
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
-      if (target && graveLevin(state) >= 5) dealDamageToFollower(state, target, 3, "レヴィオンの副団長・マイム");
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+      if (target && graveLevin(state, side) >= 5) dealDamageToFollower(state, target, 3, "レヴィオンの副団長・マイム");
       else if (target) addLog(state, "マイム的入場曲選定了目標，但墓場雷維翁・卡牌未達5張，因此沒有造成傷害。");
       break;
     }
     case "archerLevinPick": {
+      const side = pending.side ?? "player";
       const cards = (pending.data?.cards as CardInstance[]) ?? [];
       const chosen = cards.find((item) => item.uid === picked[0] && isLevinCard(item.cardId));
       if (chosen) {
         chosen.zone = "hand";
-        state.player.hand.push(chosen);
+        ps(state, side).hand.push(chosen);
         cards.splice(cards.findIndex((item) => item.uid === chosen.uid), 1);
         addLog(state, `レヴィオンの弓使い將${cardName(chosen.cardId)}加入手牌。`);
       }
       for (const rest of cards) {
         rest.zone = "grave";
-        state.player.grave.push(rest);
+        ps(state, side).grave.push(rest);
       }
       if (cards.length) addLog(state, `其餘${cards.length}張置入墓場。`);
       break;
     }
     case "transcendRevealChoice": {
+      const side = pending.side ?? "player";
       if (picked[0] !== "yes") {
         addLog(state, "你沒有支付超越者・ユリウス的公開費用，入場曲不發動。");
         break;
       }
-      const levinHand = state.player.hand.filter((item) => isLevinCard(item.cardId));
+      const levinHand = ps(state, side).hand.filter((item) => isLevinCard(item.cardId));
       if (levinHand.length < 2) break;
       state.pending = {
         kind: "multi",
@@ -3027,19 +3641,21 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
         options: levinHand.map((item) => ({ uid: item.uid, cardId: item.cardId })),
         min: 2,
         max: 2,
+        side,
       };
       break;
     }
     case "transcendRevealCards": {
-      const revealed = state.player.hand.filter((item) => picked.includes(item.uid) && isLevinCard(item.cardId));
+      const side = pending.side ?? "player";
+      const revealed = ps(state, side).hand.filter((item) => picked.includes(item.uid) && isLevinCard(item.cardId));
       if (revealed.length !== 2) break;
       addLog(state, `你公開手牌的${revealed.map((item) => cardName(item.cardId)).join("、")}。`);
-      const maxModes = graveLevin(state) >= 5 ? 3 : 1;
+      const maxModes = graveLevin(state, side) >= 5 ? 3 : 1;
       const options: ChoiceOption[] = [
         { uid: "burn", label: "②對對方主戰者造成3點傷害" },
         { uid: "draw", label: "③抽2張牌，捨棄自己1張手牌" },
       ];
-      if (state.ai.field.some(isFollower)) options.unshift({ uid: "destroy", label: "①破壞對方場上1體從者" });
+      if (ps(state, otherSide(side)).field.some(isFollower)) options.unshift({ uid: "destroy", label: "①破壞對方場上1體從者" });
       state.pending = {
         kind: "multi",
         effect: "transcendModes",
@@ -3048,35 +3664,41 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
         options,
         min: 1,
         max: Math.min(maxModes, options.length),
+        side,
       };
       break;
     }
     case "transcendModes": {
+      const side = pending.side ?? "player";
       const order = ["destroy", "burn", "draw"].filter((mode) => picked.includes(mode));
       const tasks: Task[] = order.map((mode) => {
-        if (mode === "destroy") return { type: "transcendDestroy", side: "player" as Side, label: "超越者・ユリウス①" };
-        if (mode === "burn") return { type: "leaderDamage", side: "ai" as Side, amount: 3, label: "超越者・ユリウス②" };
-        return { type: "transcendDraw", side: "player" as Side, label: "超越者・ユリウス③" };
+        if (mode === "destroy") return { type: "transcendDestroy", side, label: "超越者・ユリウス①" };
+        if (mode === "burn") return { type: "leaderDamage", side: otherSide(side), amount: 3, label: "超越者・ユリウス②" };
+        return { type: "transcendDraw", side, label: "超越者・ユリウス③" };
       });
       queueFront(state, ...tasks);
       break;
     }
     case "transcendDestroy": {
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (target) destroyFollower(state, target, "レヴィオンの超越者・ユリウス");
       break;
     }
     case "transcendDiscard": {
-      if (picked.length) discardPlayerCard(state, picked[0], "超越者・ユリウス的效果");
+      const side = pending.side ?? "player";
+      if (picked.length) discardPlayerCard(state, picked[0], "超越者・ユリウス的效果", side);
       break;
     }
     case "brutalGenoTarget": {
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (target) dealDamageToFollower(state, target, 4, "暴威の武人・ジェノ");
       break;
     }
     case "albertBuff": {
-      const target = state.player.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const target = ps(state, side).field.find((item) => item.uid === picked[0]);
       if (target) {
         target.attackBuff += 1;
         addLog(state, `アルベール使${cardName(target.cardId)}攻擊力+1。`);
@@ -3084,70 +3706,78 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       break;
     }
     case "tentacleTarget": {
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (target) dealDamageToFollower(state, target, 4, "テンタクルバイト");
-      healLeader(state, "player", 2);
-      if (state.player.field.some((item) => cardName(item.cardId).includes("ユリウス"))) {
-        drawCards(state, "player", 1);
+      healLeader(state, side, 2);
+      if (ps(state, side).field.some((item) => cardName(item.cardId).includes("ユリウス"))) {
+        drawCards(state, side, 1);
         addLog(state, "場上有ユリウス，テンタクルバイト使你抽1張。 ");
       }
       break;
     }
     case "sistersPick": {
-      const card = picked.length ? removeDeckInstance(state, "player", picked[0]) : undefined;
+      const side = pending.side ?? "player";
+      const card = picked.length ? removeDeckInstance(state, side, picked[0]) : undefined;
       if (card) {
         card.zone = "hand";
-        state.player.hand.push(card);
+        ps(state, side).hand.push(card);
         addLog(state, `レヴィオンシスターズ登場！將${cardName(card.cardId)}加入手牌。`);
       } else addLog(state, "你選擇讓レヴィオンシスターズ登場！的檢索落空。");
-      shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
+      shuffleAfterSearch(state, side, "レヴィオンシスターズ登場！");
       break;
     }
     case "sistersDeploy": {
-      deploySistersSimultaneously(state, picked);
+      const side = pending.side ?? "player";
+      deploySistersSimultaneously(state, picked, side);
       if (!picked.length) addLog(state, "你選擇讓三姊妹的檢索全部落空。");
-      shuffleAfterSearch(state, "player", "レヴィオンシスターズ登場！");
+      shuffleAfterSearch(state, side, "レヴィオンシスターズ登場！");
       break;
     }
     case "justiceTarget": {
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (target) dealDamageToFollower(state, target, 3, "レヴィオンの正義");
-      beginJusticeDukeSearch(state, Boolean(pending.data?.kicker));
+      beginJusticeDukeSearch(state, Boolean(pending.data?.kicker), side);
       break;
     }
     case "justiceDukePick": {
-      finishJusticeDukeSearch(state, Boolean(pending.data?.kicker), picked[0]);
+      finishJusticeDukeSearch(state, Boolean(pending.data?.kicker), picked[0], pending.side ?? "player");
       break;
     }
     case "justiceSaberPick": {
-      const card = picked.length ? removeDeckInstance(state, "player", picked[0]) : undefined;
-      if (card && canFitField(state, "player")) {
-        putExistingIntoField(state, card, "player", true);
+      const side = pending.side ?? "player";
+      const card = picked.length ? removeDeckInstance(state, side, picked[0]) : undefined;
+      if (card && canFitField(state, side)) {
+        putExistingIntoField(state, card, side, true);
         addLog(state, "レヴィオンの正義將レヴィオンセイバー・アルベール放置到場上。");
       } else addLog(state, "你選擇讓レヴィオンセイバー・アルベール的追加檢索落空。");
-      shuffleAfterSearch(state, "player", "レヴィオンの正義（追加檢索）");
+      shuffleAfterSearch(state, side, "レヴィオンの正義（追加檢索）");
       break;
     }
     case "runesSnipe": {
-      if (!picked.length || state.player.pp < 1) break;
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      if (!picked.length || ps(state, side).pp < 1) break;
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (target) {
-        state.player.pp -= 1;
+        ps(state, side).pp -= 1;
         dealDamageToFollower(state, target, 3, "ルネス（EVOLVE）");
       }
       break;
     }
     case "runesPutAlbert": {
+      const side = pending.side ?? "player";
       if (!picked.length) break;
-      const card = state.player.hand.find((item) => item.uid === picked[0]);
-      if (card && canFitField(state, "player")) {
-        removeFromZone(state.player, "hand", card.uid);
-        putExistingIntoField(state, card, "player", true);
+      const card = ps(state, side).hand.find((item) => item.uid === picked[0]);
+      if (card && canFitField(state, side)) {
+        removeFromZone(ps(state, side), "hand", card.uid);
+        putExistingIntoField(state, card, side, true);
         addLog(state, `ルネス（EVOLVE）將${cardName(card.cardId)}放置到場上。`);
       }
       break;
     }
     case "maimEvoPick": {
+      const side = pending.side ?? "player";
       const cards = (pending.data?.cards as CardInstance[]) ?? [];
       const eligible = new Set((pending.data?.eligible as string[]) ?? []);
       const chosenUid = picked.find((uid) => eligible.has(uid));
@@ -3155,20 +3785,21 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
         const card = cards.find((item) => item.uid === chosenUid);
         if (card) {
           card.zone = "hand";
-          state.player.hand.push(card);
+          ps(state, side).hand.push(card);
           cards.splice(cards.findIndex((item) => item.uid === card.uid), 1);
           addLog(state, `マイム（EVOLVE）將${cardName(card.cardId)}加入手牌。`);
         }
       }
-      setBottomOrder(state, "player", cards);
+      setBottomOrder(state, side, cards);
       break;
     }
     case "dukeTarget": {
-      const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (source && target && !source.tapped) {
         source.tapped = true;
-        addEvent(state, "player", "activate", { cardId: "levinDuke", detail: `target=${target.cardId}` });
+        addEvent(state, side, "activate", { cardId: "levinDuke", detail: `target=${target.cardId}` });
         dealDamageToFollower(state, target, 1, "レヴィオンデューク・ユリウス");
       }
       break;
@@ -3265,39 +3896,442 @@ export function resolveChoice(input: GameState, selected: string[]): GameState {
       break;
     }
     case "archerTarget": {
-      const source = state.player.field.find((item) => item.uid === pending.data?.sourceUid);
-      const target = state.ai.field.find((item) => item.uid === picked[0]);
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
       if (source && target && !source.tapped) {
         source.tapped = true;
-        if (graveLevin(state) >= 5) dealDamageToFollower(state, target, 3, "レヴィオンの弓使い");
+        if (graveLevin(state, side) >= 5) dealDamageToFollower(state, target, 3, "レヴィオンの弓使い");
         else addLog(state, "弓使い支付橫置費用，但墓場雷維翁・卡牌未達5張，因此沒有造成傷害。");
       }
       break;
     }
-    case "guardChoice":
+    case "guardChoice": {
+      const side = pending.side ?? "player";
       for (const uid of picked) {
-        const ward = state.player.field.find((item) => item.uid === uid);
+        const ward = ps(state, side).field.find((item) => item.uid === uid);
         if (ward && hasKeyword(state, ward, "ward") && !ward.tapped) ward.tapped = true;
       }
       addLog(state, `你讓${picked.length}體守護從者進入橫置守護狀態。`);
-      continueEndTurnMutable(state);
+      if (side === "player") continueEndTurnMutable(state);
+      else aiEndPhase(state);
       break;
+    }
     case "discardToSeven":
       for (const uid of picked) discardPlayerCard(state, uid, "手牌上限");
       // 捨棄本身可能觸發傑諾等需要玩家回答的效果。換回合任務排在
       // 這些觸發之後，確保最後一個選擇完成才讓對手開始行動。
       queue(state, { type: "finishPlayerTurn", side: "player", label: "手牌上限處理後結束回合" });
       break;
-    case "aiDiscardToSeven":
-      for (const uid of picked) {
-        const card = removeFromZone(state.ai, "hand", uid);
-        if (!card) continue;
-        card.zone = "grave";
-        if (!cardIsToken(card)) state.ai.grave.push(card);
-        addLog(state, `破壞巫因手牌上限捨棄${cardName(card.cardId)}。`);
-      }
-      finishTurnSwitchMutable(state);
+    case "aiDiscardToSeven": {
+      // 用 discardPlayerCard 讓 ai 槽的雷維翁（傑諾）捨棄觸發也能生效；
+      // 換回合排成任務，等捨棄引發的選擇（若有）完成後才切換回合。
+      for (const uid of picked) discardPlayerCard(state, uid, "手牌上限", "ai");
+      queue(state, { type: "finishPlayerTurn", side: "ai", label: "手牌上限處理後結束回合" });
       break;
+    }
+    case "owlmanBuff": {
+      const side = pending.side ?? "player";
+      const target = ps(state, side).field.find((item) => item.uid === picked[0]);
+      if (target) {
+        target.attackBuff += 1;
+        target.healthBuff += 1;
+        addLog(state, `オウルマン使${cardName(target.cardId)}+1/+1。`);
+      }
+      break;
+    }
+    case "foxfirePick": {
+      const side = pending.side ?? "player";
+      const cards = (pending.data?.cards as CardInstance[]) ?? [];
+      const eligible = new Set((pending.data?.eligible as string[]) ?? []);
+      const chosenUid = picked.find((uid) => eligible.has(uid));
+      if (chosenUid) {
+        const card = cards.find((item) => item.uid === chosenUid);
+        if (card) {
+          card.zone = "hand";
+          ps(state, side).hand.push(card);
+          cards.splice(cards.findIndex((item) => item.uid === card.uid), 1);
+          addLog(state, `宿命の狐火・セッカ公開${cardName(card.cardId)}並加入手牌。`);
+          queue(state, { type: "foxfireDiscard", side, label: "宿命の狐火・セッカ的強制捨棄" });
+        }
+      }
+      setBottomOrder(state, side, cards);
+      break;
+    }
+    case "foxfireDiscard": {
+      const side = pending.side ?? "player";
+      if (picked.length) discardPlayerCard(state, picked[0], "宿命の狐火・セッカ", side);
+      break;
+    }
+    case "sekkaIgniteCost": {
+      const side = pending.side ?? "player";
+      const me = ps(state, side);
+      const source = me.grave.find((item) => item.uid === pending.data?.sourceUid);
+      const costs = picked
+        .map((uid) => me.grave.find((item) => item.uid === uid))
+        .filter(Boolean) as CardInstance[];
+      if (!source || costs.length !== 2 || me.pp < 3 || (me.evolveRemaining.sekkaAdvance ?? 0) <= 0 || !canFitField(state, side)) break;
+      me.pp -= 3;
+      addEvent(state, side, "activate", { cardId: "foxfireSekka", pp: me.pp, detail: `sekkaIgnite banish=${costs.map((item) => item.cardId).join(",")}` });
+      moveCardToBanished(state, side, source, "grave");
+      for (const cost of costs) moveCardToBanished(state, side, cost, "grave");
+      addLog(state, `宿命の狐火・セッカ消滅自己與墓場的${costs.map((item) => cardName(item.cardId)).join("、")}。`);
+      me.evolveRemaining.sekkaAdvance -= 1;
+      me.evolveUsed.sekkaAdvance = (me.evolveUsed.sekkaAdvance ?? 0) + 1;
+      const advance = makeInstance(state, "sekkaAdvance", side, "field");
+      putExistingIntoField(state, advance, side, true);
+      addLog(state, "九火石炎・セッカ從進化區放置到場上。 ");
+      break;
+    }
+    case "sekkaAdvanceMode": {
+      const side = pending.side ?? "player";
+      if (picked[0] === "deck") {
+        const candidates = searchDeckInstances(state, side, (item) => item.cardId === "ninetailResolve");
+        if (!candidates.length) {
+          addLog(state, "牌庫中沒有『九尾の決意』，檢索落空。");
+          shuffleAfterSearch(state, side, "九火石炎・セッカ");
+          break;
+        }
+        state.pending = {
+          kind: "multi",
+          effect: "sekkaAdvanceDeckPick",
+          title: "九火石炎・セッカ",
+          prompt: "可以從牌庫選擇1張『九尾の決意』加入手牌；也可以不選。之後洗牌。",
+          options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+          min: 0,
+          max: 1,
+          side,
+        };
+        break;
+      }
+      const card = removeFromZone(ps(state, side), "grave", picked[0]);
+      if (card && card.cardId === "ninetailResolve") {
+        card.zone = "hand";
+        ps(state, side).hand.push(card);
+        addLog(state, "九火石炎・セッカ從墓場將九尾の決意加入手牌。 ");
+      }
+      break;
+    }
+    case "sekkaAdvanceDeckPick": {
+      const side = pending.side ?? "player";
+      const card = picked.length ? removeDeckInstance(state, side, picked[0]) : undefined;
+      if (card && card.cardId === "ninetailResolve") {
+        card.zone = "hand";
+        ps(state, side).hand.push(card);
+        addLog(state, "九火石炎・セッカ將九尾の決意加入手牌。 ");
+      } else addLog(state, "你選擇讓九火石炎・セッカ的檢索落空。");
+      shuffleAfterSearch(state, side, "九火石炎・セッカ");
+      break;
+    }
+    case "cheshireDamage": {
+      const side = pending.side ?? "player";
+      const enemy = otherSide(side);
+      const amount = Number(pending.data?.amount ?? 1);
+      if (picked[0] === `${enemy}-leader`) damageLeader(state, enemy, amount);
+      else {
+        const target = ps(state, enemy).field.find((item) => item.uid === picked[0]);
+        if (target) dealDamageToFollower(state, target, amount, "チェシャキャット");
+      }
+      break;
+    }
+    case "cheshireCounterTarget": {
+      const side = pending.side ?? "player";
+      const source = ps(state, side).field.find((item) => item.uid === pending.data?.sourceUid);
+      const target = [...ps(state, side).field, ...ps(state, side).ex]
+        .find((item) => item.uid === picked[0] && isFairyTaleCard(item.cardId));
+      if (!source || source.tapped || !target) break;
+      source.tapped = true;
+      removeFromZone(ps(state, side), "field", source.uid);
+      cleanupEvolveCard(state, source);
+      source.zone = "deck";
+      source.tapped = false;
+      source.damage = 0;
+      source.attackBuff = 0;
+      source.healthBuff = 0;
+      source.tempStorm = false;
+      source.tempRush = false;
+      source.tempDesignated = false;
+      ps(state, side).deck.unshift(source);
+      target.flags.fairyTaleCounters = (Number(target.flags.fairyTaleCounters) || 0) + 2;
+      addEvent(state, side, "activate", { cardId: "cheshireCat", detail: `counters=${target.uid}` });
+      addLog(state, `チェシャキャット置於牌庫底，${cardName(target.cardId)}獲得2個童話指示物（本卡池無消耗者，僅作紀錄）。`);
+      break;
+    }
+    case "carbuncleBounce": {
+      const side = pending.side ?? "player";
+      if (!picked.length) break;
+      const target = ps(state, side).field.find((item) => item.uid === picked[0]);
+      if (!target) break;
+      bounceFollower(state, target);
+      drawCards(state, side, 1);
+      addLog(state, "ベビーカーバンクル使你抽1張。 ");
+      break;
+    }
+    case "anemoneBounce": {
+      const side = pending.side ?? "player";
+      if (!picked.length) break;
+      const target = ps(state, side).field.find((item) => item.uid === picked[0]);
+      if (!target) break;
+      bounceFollower(state, target);
+      const candidates = searchDeckInstances(state, side, (item) => item.cardId === "salviaPanther");
+      if (!candidates.length) {
+        addLog(state, "牌庫中沒有『サルビアパンサー』，檢索落空。");
+        shuffleAfterSearch(state, side, "アネモネタイガー");
+        break;
+      }
+      state.pending = {
+        kind: "multi",
+        effect: "anemoneSearch",
+        title: "アネモネタイガー",
+        prompt: "可以從牌庫選擇1張『サルビアパンサー』加入手牌；也可以不選。之後洗牌。",
+        options: candidates.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 0,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "anemoneSearch": {
+      const side = pending.side ?? "player";
+      const card = picked.length ? removeDeckInstance(state, side, picked[0]) : undefined;
+      if (card && card.cardId === "salviaPanther") {
+        card.zone = "hand";
+        ps(state, side).hand.push(card);
+        addLog(state, "アネモネタイガー將サルビアパンサー加入手牌。 ");
+      } else addLog(state, "你選擇讓アネモネタイガー的檢索落空。");
+      shuffleAfterSearch(state, side, "アネモネタイガー");
+      break;
+    }
+    case "cuttingDiscard": {
+      const side = pending.side ?? "player";
+      if (!picked.length) break;
+      if (!discardPlayerCard(state, picked[0], "カッティングキャット", side)) break;
+      const cards = topCards(state, side, 3);
+      if (!cards.length) break;
+      const eligible = cards.filter((item) => isAcademyCard(item.cardId) || isBeastCard(item.cardId));
+      userTopSearch(state, cards, eligible, "cuttingPick", "カッティングキャット：查看牌頂3張", 1, side);
+      break;
+    }
+    case "cuttingPick": {
+      const side = pending.side ?? "player";
+      const cards = (pending.data?.cards as CardInstance[]) ?? [];
+      const eligible = new Set((pending.data?.eligible as string[]) ?? []);
+      const chosenUid = picked.find((uid) => eligible.has(uid));
+      if (chosenUid) {
+        const card = cards.find((item) => item.uid === chosenUid);
+        if (card) {
+          card.zone = "hand";
+          ps(state, side).hand.push(card);
+          cards.splice(cards.findIndex((item) => item.uid === card.uid), 1);
+          addLog(state, `カッティングキャット將${cardName(card.cardId)}加入手牌。`);
+        }
+      }
+      setBottomOrder(state, side, cards);
+      break;
+    }
+    case "ninetailModes": {
+      const side = pending.side ?? "player";
+      const tasks: Task[] = [];
+      if (picked.includes("mode1")) tasks.push({ type: "ninetailMode1", side, label: "九尾の決意①" });
+      if (picked.includes("mode2")) tasks.push({ type: "ninetailMode2", side, label: "九尾の決意②" });
+      queueFront(state, ...tasks);
+      break;
+    }
+    case "ninetailMode1Target": {
+      const side = pending.side ?? "player";
+      const target = ps(state, side).field.find((item) => item.uid === picked[0]);
+      if (!target) break;
+      if (ps(state, side).banished.length >= 9) {
+        target.attackBuff += 2;
+        target.healthBuff += 2;
+        target.flags.permStorm = true;
+        addLog(state, "九尾の決意①：九火石炎・セッカ+2/+2並獲得【疾走】。 ");
+      } else addLog(state, "九尾の決意①：消滅領域未達9張，效果落空。");
+      break;
+    }
+    case "ninetailMode2Own": {
+      const side = pending.side ?? "player";
+      const own = ps(state, side).field.find((item) => item.uid === picked[0]);
+      const enemies = ps(state, otherSide(side)).field.filter(isFollower);
+      if (!own || !enemies.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "ninetailMode2Enemy",
+        title: "九尾の決意②",
+        prompt: "選擇對方場上1體從者。前者+2/+2之後，對其造成前者攻擊力的傷害。",
+        options: enemies.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+        data: { ownUid: own.uid },
+      };
+      break;
+    }
+    case "ninetailMode2Enemy": {
+      const side = pending.side ?? "player";
+      const own = ps(state, side).field.find((item) => item.uid === pending.data?.ownUid);
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+      if (!own || !target) break;
+      own.attackBuff += 2;
+      own.healthBuff += 2;
+      addLog(state, `九尾の決意②：${cardName(own.cardId)}+2/+2。`);
+      dealDamageToFollower(state, target, attackOf(own), "九尾の決意②");
+      break;
+    }
+    case "heroResolveEnemy": {
+      const side = pending.side ?? "player";
+      const ownBeasts = ps(state, side).field.filter((item) => isFollower(item) && isBeastCard(item.cardId));
+      if (!ownBeasts.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "heroResolveOwn",
+        title: "英雄の覚悟",
+        prompt: "選擇自己場上1體獸・從者，使其攻擊力+1／體力+1。",
+        options: ownBeasts.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+        data: { enemyUid: picked[0] },
+      };
+      break;
+    }
+    case "heroResolveOwn": {
+      const side = pending.side ?? "player";
+      const enemyTarget = ps(state, otherSide(side)).field.find((item) => item.uid === pending.data?.enemyUid);
+      if (enemyTarget) dealDamageToFollower(state, enemyTarget, 4, "英雄の覚悟");
+      const own = ps(state, side).field.find((item) => item.uid === picked[0]);
+      if (own) {
+        own.attackBuff += 1;
+        own.healthBuff += 1;
+        addLog(state, `英雄の覚悟使${cardName(own.cardId)}+1/+1。`);
+      }
+      break;
+    }
+    case "greenManifestPick": {
+      const side = pending.side ?? "player";
+      const cards = (pending.data?.cards as CardInstance[]) ?? [];
+      const eligible = new Set((pending.data?.eligible as string[]) ?? []);
+      const entered: CardInstance[] = [];
+      for (const uid of picked.filter((item) => eligible.has(item))) {
+        const card = cards.find((item) => item.uid === uid);
+        if (!card) continue;
+        if (putExistingIntoField(state, card, side, false)) {
+          entered.push(card);
+          cards.splice(cards.findIndex((item) => item.uid === uid), 1);
+          addLog(state, `緑の顕現將${cardName(card.cardId)}放置到場上。`);
+        }
+      }
+      const triggers: Task[] = entered.map((card) => {
+        const fanfare: Task = { type: "fanfare", side, sourceUid: card.uid, cardId: card.cardId, label: `${cardName(card.cardId)}的入場曲` };
+        return hasKeyword(state, card, "ward")
+          ? { type: "wardOnEntry", side, sourceUid: card.uid, data: { tasks: [fanfare] }, label: `${cardName(card.cardId)}的守護進場選擇` }
+          : fanfare;
+      });
+      queue(state, { type: "greenBuff", side, label: "緑の顕現的全體強化" });
+      if (triggers.length) queue(state, { type: "triggerGroup", side, data: { tasks: triggers }, label: "緑の顕現的入場曲群" });
+      setBottomOrder(state, side, cards);
+      break;
+    }
+    case "rabbitReturn": {
+      const side = pending.side ?? "player";
+      if (!picked.length) break;
+      const card = ps(state, side).hand.find((item) => item.uid === picked[0] && item.cardId === "swordRabbit");
+      if (card && canFitField(state, side)) {
+        removeFromZone(ps(state, side), "hand", card.uid);
+        putExistingIntoField(state, card, side, true);
+        card.flags.fromHand = true;
+        addLog(state, "ソードラビット的回手觸發：另一張ソードラビット放置到場上。 ");
+      }
+      break;
+    }
+    case "dwarfSnipe": {
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+      if (target) {
+        dealDamageToFollower(state, target, 5, "伐採斧のドワーフ");
+        damageLeader(state, otherSide(side), 1);
+      }
+      break;
+    }
+    case "dwarfDeploy": {
+      const side = pending.side ?? "player";
+      if (!picked.length) break;
+      const card = ps(state, side).hand.find((item) => item.uid === picked[0]);
+      if (card && canFitField(state, side)) {
+        removeFromZone(ps(state, side), "hand", card.uid);
+        putExistingIntoField(state, card, side, true);
+        card.flags.fromHand = true;
+        addLog(state, `伐採斧のドワーフ將${cardName(card.cardId)}放置到場上。`);
+      }
+      break;
+    }
+    case "blossomEvoPick": {
+      const side = pending.side ?? "player";
+      const cards = (pending.data?.cards as CardInstance[]) ?? [];
+      const eligible = new Set((pending.data?.eligible as string[]) ?? []);
+      const chosenUid = picked.find((uid) => eligible.has(uid));
+      if (chosenUid && ps(state, side).ex.length < 5) {
+        const card = cards.find((item) => item.uid === chosenUid);
+        if (card) {
+          card.zone = "ex";
+          ps(state, side).ex.push(card);
+          cards.splice(cards.findIndex((item) => item.uid === card.uid), 1);
+          addLog(state, `ブロッサムルナール將${cardName(card.cardId)}置入EX區。`);
+        }
+      }
+      setBottomOrder(state, side, cards);
+      break;
+    }
+    case "cuttingEvoBounce": {
+      const side = pending.side ?? "player";
+      if (!picked.length) break;
+      const target = ps(state, side).field.find((item) => item.uid === picked[0]);
+      if (!target) break;
+      bounceFollower(state, target);
+      const enemies = ps(state, otherSide(side)).field.filter(isFollower);
+      if (!enemies.length) break;
+      state.pending = {
+        kind: "single",
+        effect: "cuttingEvoTarget",
+        title: "カッティングキャット（EVOLVE）",
+        prompt: "選擇對方場上1體從者，對其造成3點傷害。",
+        options: enemies.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+        min: 1,
+        max: 1,
+        side,
+      };
+      break;
+    }
+    case "cuttingEvoTarget": {
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+      if (target) dealDamageToFollower(state, target, 3, "カッティングキャット（EVOLVE）");
+      break;
+    }
+    case "salviaEvoBounce": {
+      const side = pending.side ?? "player";
+      const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+      if (target && definition(baseCardId(target)).cost <= 3) bounceFollower(state, target);
+      break;
+    }
+    case "tigerGirlStrike": {
+      const side = (pending.data?.side as Side) ?? "player";
+      const attackerUid = pending.data?.attackerUid as string;
+      const targetUid = pending.data?.targetUid as string;
+      if (picked[0] !== "pass") {
+        const target = ps(state, otherSide(side)).field.find((item) => item.uid === picked[0]);
+        const beasts = graveBeastCards(state, side).slice(0, 3);
+        if (target && beasts.length === 3) {
+          for (const beast of beasts) moveCardToBanished(state, side, beast, "grave");
+          addLog(state, `タイガーガール消滅墓場的${beasts.map((item) => cardName(item.cardId)).join("、")}。`);
+          dealDamageToFollower(state, target, 4, "タイガーガール【攻擊時】");
+        }
+      }
+      queueFront(state, side === "player"
+        ? { type: "manualPlayerAttackCombat", side: "player", data: { attackerUid, targetUid }, label: "タイガーガール攻擊的戰鬥結算" }
+        : { type: "aiAttackCombatResolve", side: "ai", data: { attackerUid, targetUid }, label: "タイガーガール攻擊的戰鬥結算" });
+      break;
+    }
     default:
       break;
   }
@@ -3793,6 +4827,29 @@ export function endTurnForSide(input: GameState, side: Side): GameState {
     state.aiControl !== "manual" || state.pending || state.status !== "playing"
     || state.turnSide !== "ai" || state.phase !== "main"
   ) return state;
+  state.phase = "end";
+  // ai 槽的雷維翁：ミイム的結束階段回血（破壞巫牌組沒有這張卡，不影響既有模式）。
+  for (const miim of state.ai.field.filter((item) => item.cardId === "levinMiim")) {
+    if (graveLevin(state, "ai") >= 5) {
+      healLeader(state, "ai", 1);
+      addLog(state, `${cardName(miim.cardId)}的結束階段效果發動。`);
+    }
+  }
+  // ai 槽的守護從者：結束階段可選擇橫置進入守護（破壞巫牌組沒有守護從者）。
+  const wards = state.ai.field.filter((item) => isFollower(item) && !item.tapped && hasKeyword(state, item, "ward"));
+  if (wards.length) {
+    state.pending = {
+      kind: "multi",
+      effect: "guardChoice",
+      title: "結束階段：守護",
+      prompt: "選擇要橫置並進入守護狀態的從者。可以選任意數量，也可以全部不選。",
+      options: wards.map((item) => ({ uid: item.uid, cardId: item.cardId })),
+      min: 0,
+      max: wards.length,
+      side: "ai",
+    };
+    return state;
+  }
   aiEndPhase(state);
   return state;
 }
@@ -3802,6 +4859,11 @@ function declareAiAttack(state: GameState, attacker: CardInstance, targetUid: st
   const legal = attackTargets(state, attacker).map((item) => item.uid);
   if (!legal.includes(targetUid)) return false;
   attacker.tapped = true;
+  if (attacker.cardId === "levinMeim" && graveLevin(state, attacker.owner) >= 5) {
+    attacker.attackBuff += 2;
+    attacker.healthBuff += 1;
+    addLog(state, "メイム的【攻擊時】：+2/+1。 ");
+  }
   if (targetUid === "player-leader") {
     addLog(state, `${cardName(attacker.cardId)}攻擊你的主戰者。`);
     addEvent(state, "ai", "attack", { cardId: attacker.cardId, detail: `atk=${attackOf(attacker)} target=leader` });
@@ -3820,6 +4882,7 @@ function resolveAiAttackCombat(state: GameState, attackerUid: string, targetUid:
     addLog(state, "攻擊從者在傷害結算前離場，本次攻擊不造成傷害。");
     return;
   }
+  if (maybeTigerGirlStrike(state, "ai", attackerUid, targetUid)) return;
   if (targetUid === "player-leader") {
     damageLeader(state, "player", attackOf(attacker));
     return;
@@ -3831,9 +4894,9 @@ function resolveAiAttackCombat(state: GameState, attackerUid: string, targetUid:
   }
   const attackerDamage = attackOf(target);
   const targetDamage = attackOf(attacker);
-  dealDamageToFollower(state, target, targetDamage, "交戰");
+  dealDamageToFollower(state, target, targetDamage, "交戰", "combat");
   const still = state.ai.field.find((item) => item.uid === attacker.uid);
-  if (still) dealDamageToFollower(state, still, attackerDamage, "交戰");
+  if (still) dealDamageToFollower(state, still, attackerDamage, "交戰", "combat");
 }
 
 function followerValue(state: GameState, card: CardInstance): number {
@@ -4080,7 +5143,7 @@ function finishTurnSwitchMutable(state: GameState): void {
 }
 
 export function restartWithSameSeed(state: GameState, playerFirst = state.playerFirst): GameState {
-  return createGame(playerFirst, state.seed, state.playerDeck, { aiControl: state.aiControl });
+  return createGame(playerFirst, state.seed, state.playerDeck, { aiControl: state.aiControl, aiDeck: state.aiDeck });
 }
 
 export function publicSummary(state: GameState) {

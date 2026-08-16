@@ -13,7 +13,34 @@ import {
 } from "./engine";
 import type { TrainingAction } from "./training";
 
-export const TRAINING_CARD_IDS = Object.keys(CARDS).sort();
+/**
+ * 已部署模型（destruction cycle 13 等）訓練時的卡牌字典順序，永久凍結。
+ * 之後加入的新卡一律 append 在這個前綴之後，確保舊卡索引永不改變，
+ * 舊 manifest 的模型才能在擴充後的卡池上繼續運作。不要重排、不要插入。
+ */
+export const FROZEN_CARD_ORDER: readonly string[] = [
+  "annihilationSong", "antiAir", "axia", "axiaEvo", "blackArtifact",
+  "bouquetFairy", "breathFairyDancer", "brutalGeno", "destructionAffirmerEvo",
+  "destructionFanatic", "destructionHermit", "destructionJoy", "destructionPrayer",
+  "destructionServant", "destructionServantEvo", "destructionWilderness",
+  "destructiveLishenna", "destructiveLishennaEvo", "dissonanceWorshipper",
+  "fairy", "fairyArcher", "fairyBladeAmatsu", "fairyDragon", "fairyWisp",
+  "fairyland", "forestFairy", "forestFairyEvo", "gawain", "greatZelgenea",
+  "levinAlbert", "levinArcher", "levinAxeGeno", "levinDuke", "levinJustice",
+  "levinMaim", "levinMaimEvo", "levinMeim", "levinMiim", "levinRunes",
+  "levinRunesEvo", "levinSisters", "levinTranscend", "manifestedLishenna",
+  "miasmaAria", "miasmaAriaEvo", "naturalAria", "naturalAriaEvo", "newBlack",
+  "newWhite", "originalLishenna", "pureWaterFairy", "queenCynthia",
+  "returningDissonance", "reverseAmatsu", "reverseAmatsuEvo", "riotousGarden",
+  "solo", "tailwindFairy", "tentacleBite", "vistaElf", "whiteArtifact",
+  "whiteBlackChapter", "wingQueen", "wonderTree", "zelgenea",
+];
+
+const FROZEN_CARD_SET = new Set(FROZEN_CARD_ORDER);
+export const TRAINING_CARD_IDS = [
+  ...FROZEN_CARD_ORDER,
+  ...Object.keys(CARDS).filter((cardId) => !FROZEN_CARD_SET.has(cardId)).sort(),
+];
 const CARD_INDEX = new Map(TRAINING_CARD_IDS.map((cardId, index) => [cardId, index + 1]));
 
 export const TRAINING_ZONE_NAMES = [

@@ -18,13 +18,14 @@ import {
   playCardForSide,
   remainingHealthOf,
   resolveChoice,
+  type AiDeckId,
   type CardInstance,
   type GameState,
   type PendingChoice,
   type PlayerState,
   type Zone,
 } from "./engine";
-import { AI_DECK, PLAYER_DECKS, cardName, type PlayerDeckId, type Side } from "./cards";
+import { AI_DECK, CARDS, PLAYER_DECKS, cardName, type PlayerDeckId, type Side } from "./cards";
 
 export type TrainingAction =
   | { key: string; kind: "mulligan"; redraw: boolean; label: string }
@@ -126,6 +127,8 @@ export type TrainingReplay = {
   playerFirst: boolean;
   playerDeck: PlayerDeckId;
   aiControl?: GameState["aiControl"];
+  /** ai 槽牌組；舊回放沒有此欄位時視為 "destruction"。 */
+  aiDeck?: AiDeckId;
   decisions: TrainingReplayDecision[];
   result?: TrainingReplayResult;
 };
@@ -175,13 +178,28 @@ function pendingActions(pending: PendingChoice): TrainingAction[] {
   const uids = options.map((option) => option.uid);
   let selections: string[][] = [];
   if (pending.kind === "order") {
-    if (pending.max <= uids.length) selections = orderedSelections(uids, pending.max);
+    if (pending.max <= uids.length) {
+      // 5張以上的排列會爆炸（5!=120、6!=720），而牌庫底順序的策略價值趨近於零；
+      // 超過4張只提供「原順序」與「反序」兩個代表動作。4張以下維持全枚舉（既有回放相容）。
+      if (uids.length <= 4) selections = orderedSelections(uids, pending.max);
+      else selections = [uids.slice(0, pending.max), [...uids].reverse().slice(0, pending.max)];
+    }
   } else if (pending.kind === "single" || pending.kind === "yesNo" || pending.kind === "triggerOrder") {
     if (pending.min === 0) selections.push([]);
     selections.push(...uids.map((uid) => [uid]));
   } else {
     const max = Math.min(pending.max, uids.length);
     for (let count = pending.min; count <= max; count += 1) selections.push(...combinations(uids, count));
+  }
+  // 通用組合約束（緑の顕現等）：所選卡牌的原本費用合計不得超過 maxTotalCost，
+  // 超過的組合不列為合法動作（引擎的 resolveChoice 也會拒絕）。
+  const maxTotalCost = pending.data?.maxTotalCost as number | undefined;
+  if (maxTotalCost !== undefined) {
+    const costOf = (uid: string): number => {
+      const option = pending.options.find((item) => item.uid === uid);
+      return option?.cardId ? CARDS[option.cardId].cost : 0;
+    };
+    selections = selections.filter((selected) => selected.reduce((sum, uid) => sum + costOf(uid), 0) <= maxTotalCost);
   }
   return selections.map((selected) => ({
     key: `choice:${selected.length ? selected.join(",") : "none"}`,
@@ -242,6 +260,7 @@ export function trainingActor(state: GameState): Side | undefined {
 /** 玩家視角的 observation：包含已知牌表與自己手牌，但不包含對手手牌或任何牌庫順序。 */
 export function trainingObservation(state: GameState, actor = trainingActor(state) ?? "player"): TrainingObservation {
   const playerDeck = PLAYER_DECKS[state.playerDeck];
+  const aiDeckList = state.aiDeck === "destruction" ? AI_DECK : PLAYER_DECKS[state.aiDeck].main;
   const self = actor === "player" ? state.player : state.ai;
   const opponent = actor === "player" ? state.ai : state.player;
   return {
@@ -256,8 +275,8 @@ export function trainingObservation(state: GameState, actor = trainingActor(stat
     phase: state.phase,
     playedThisTurn: state.playedThisTurn,
     evolvedThisTurn: state.evolvedThisTurn,
-    ownDeckList: deckCounts(actor === "player" ? playerDeck.main : AI_DECK),
-    opponentDeckList: deckCounts(actor === "player" ? AI_DECK : playerDeck.main),
+    ownDeckList: deckCounts(actor === "player" ? playerDeck.main : aiDeckList),
+    opponentDeckList: deckCounts(actor === "player" ? aiDeckList : playerDeck.main),
     self: sideView(self, true),
     opponent: sideView(opponent, false),
     pending: state.pending ? {
@@ -338,7 +357,20 @@ export function trainingLegalActions(state: GameState): TrainingAction[] {
       }
     }
   }
-  if (actor === "ai") {
+  // 墓場起動能力（例：宿命の狐火・セッカ）；cardActions 對雙方墓場都會枚舉。
+  for (const card of actorState.grave) {
+    for (const action of cardActions(state, card.uid, "grave", actor).filter((item) => item.enabled)) {
+      actions.push({
+        key: `activate:${actor}:${action.id}:${card.uid}`,
+        kind: "activate",
+        uid: card.uid,
+        abilityId: action.id,
+        cardId: card.cardId,
+        label: `${action.label}：${cardName(card.cardId)}`,
+      });
+    }
+  }
+  if (actor === "ai" && state.aiDeck === "destruction") {
     for (const activation of manualAiActivations(state)) actions.push({
       key: `activate:ai:${activation.key}`,
       kind: "activate",
@@ -377,7 +409,7 @@ export function applyTrainingAction(input: GameState, action: TrainingAction): G
         if (!activation) throw new Error(`Missing manual AI activation: ${legal.activationKey}`);
         return activateManualAi(input, activation);
       }
-      return activateFieldCard(input, legal.uid, legal.abilityId);
+      return activateFieldCard(input, legal.uid, legal.abilityId, actor);
     case "evolve":
       return evolveCardForSide(input, actor, legal.uid, legal.payment, legal.superEvolve);
     case "end":
@@ -403,6 +435,7 @@ function assertReplayMatchesState(replay: TrainingReplay, state: GameState): voi
     throw new Error("Replay metadata does not match game state");
   }
   if ((replay.aiControl ?? "scripted") !== state.aiControl) throw new Error("Replay control mode does not match game state");
+  if ((replay.aiDeck ?? "destruction") !== state.aiDeck) throw new Error("Replay AI deck does not match game state");
 }
 
 /** 從剛建立、尚未換牌的局面開始錄影。回放只存動作，不存隱藏資訊。 */
@@ -418,6 +451,7 @@ export function createTrainingReplay(state: GameState): TrainingReplay {
     playerFirst: state.playerFirst,
     playerDeck: state.playerDeck,
     aiControl: state.aiControl,
+    aiDeck: state.aiDeck,
     decisions: [],
   };
 }
@@ -488,7 +522,10 @@ export function replayTrainingGame(replay: TrainingReplay): { states: GameState[
   if (replay.format !== "shadowverse-pt-training-replay" || replay.replayVersion !== 1) {
     throw new Error("Unsupported training replay format");
   }
-  let state = createGame(replay.playerFirst, replay.seed, replay.playerDeck, { aiControl: replay.aiControl ?? "scripted" });
+  let state = createGame(replay.playerFirst, replay.seed, replay.playerDeck, {
+    aiControl: replay.aiControl ?? "scripted",
+    aiDeck: replay.aiDeck ?? "destruction",
+  });
   if (state.version !== replay.engineVersion) throw new Error("Replay was recorded with a different engine version");
   const states = [state];
   for (const [index, decision] of replay.decisions.entries()) {

@@ -3,22 +3,25 @@ import test from "node:test";
 import {
   __testing,
   activateFieldCard,
+  attackCardForSide,
   attackTargets,
   cardActions,
   createGame,
   definition,
   endTurn,
+  evolveCard,
   finishManualMulligan,
   finishMulligan,
   hasKeyword,
   playCard,
+  playCardForSide,
   resolveChoice,
   restartWithSameSeed,
   type CardInstance,
   type GameState,
   type Zone,
 } from "../src/game/engine.ts";
-import { isLevinCard } from "../src/game/cards.ts";
+import { CARDS, PLAYER_DECKS, SEKKA_DECK, SEKKA_EVOLVE, isLevinCard } from "../src/game/cards.ts";
 import {
   applyTrainingAction,
   createTrainingReplay,
@@ -34,6 +37,8 @@ import {
 import {
   encodeTrainingAction,
   encodeTrainingState,
+  FROZEN_CARD_ORDER,
+  TRAINING_CARD_IDS,
   TRAINING_ENCODING_METADATA,
 } from "../src/game/training-encoding.ts";
 import { buildBrowserPolicyInputs } from "../src/game/browser-policy-input.ts";
@@ -1159,4 +1164,397 @@ test("fifty deterministic games advance through repeated player and AI turns wit
     assert.ok(actions < 250, `seed ${seed} entered an action loop`);
     assert.equal(state.pending, undefined, `seed ${seed} left a pending choice`);
   }
+});
+
+// ───────────────────────── 任意牌組 vs 任意牌組（aiDeck）─────────────────────────
+
+/** 固定 seed 的 PRNG（mulberry32），讓隨機對局測試可重現。 */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function pairPlaying(playerDeck: "fairy" | "levin" | "sekka", aiDeck: "fairy" | "levin" | "sekka", seed = 7, playerFirst = true): GameState {
+  let state = createGame(playerFirst, seed, playerDeck, { aiControl: "manual", aiDeck });
+  state = finishManualMulligan(state, "player", false);
+  state = finishManualMulligan(state, "ai", false);
+  return state;
+}
+
+function runRandomPairLeague(playerDeck: "fairy" | "levin" | "sekka", aiDeck: "fairy" | "levin" | "sekka"): void {
+  for (let seed = 1; seed <= 50; seed += 1) {
+    const rand = mulberry32(seed * 7919 + 17);
+    let state = createGame(seed % 2 === 0, seed, playerDeck, { aiControl: "manual", aiDeck });
+    let decisions = 0;
+    while (state.status !== "gameover" && decisions < 500) {
+      const actions = trainingLegalActions(state);
+      assert.ok(actions.length > 0, `seed ${seed} (${playerDeck} vs ${aiDeck}) has no legal action after ${decisions} decisions`);
+      state = applyTrainingAction(state, actions[Math.floor(rand() * actions.length)]);
+      decisions += 1;
+    }
+    if (state.status !== "gameover") {
+      assert.ok(trainingLegalActions(state).length > 0, `seed ${seed} (${playerDeck} vs ${aiDeck}) is stuck on a pending choice at the decision cap`);
+    }
+  }
+}
+
+test("a non-destruction AI deck demands manual control", () => {
+  assert.throws(() => createGame(true, 1, "levin", { aiDeck: "fairy" }), /manual/);
+  assert.throws(() => createGame(true, 1, "levin", { aiControl: "scripted", aiDeck: "fairy" }), /manual/);
+  const state = createGame(true, 1, "levin", { aiControl: "manual", aiDeck: "fairy" });
+  assert.equal(state.aiDeck, "fairy");
+  assert.equal(createGame(true, 1, "levin").aiDeck, "destruction");
+});
+
+test("fifty random Levin-versus-Fairy pair games advance without a stall or a throw", () => {
+  runRandomPairLeague("levin", "fairy");
+});
+
+test("fifty random Fairy-versus-Levin pair games advance without a stall or a throw", () => {
+  runRandomPairLeague("fairy", "levin");
+});
+
+test("an AI-slot Miim counts its own side's hand and draws for the AI side", () => {
+  const state = pairPlaying("fairy", "levin");
+  state.ai.hand = [];
+  const discardTarget = __testing.makeInstance(state, "levinSisters", "ai", "hand");
+  state.ai.hand.push(discardTarget);
+  const drawTarget = __testing.makeInstance(state, "gawain", "ai", "deck");
+  state.ai.deck.push(drawTarget);
+  const playerHandBefore = state.player.hand.length;
+  const miim = addField(state, "ai", "levinMiim");
+  __testing.resolveTask(state, { type: "fanfare", side: "ai", sourceUid: miim.uid, cardId: "levinMiim" });
+  assert.equal(state.pending?.effect, "miimDiscard");
+  assert.equal(state.pending?.side, "ai", "the AI side must answer its own Fanfare");
+  assert.deepEqual(state.pending?.options.map((option) => option.uid), [discardTarget.uid], "only the AI hand is offered");
+  const resolved = resolveChoice(state, [discardTarget.uid]);
+  assert.equal(resolved.ai.grave.some((card) => card.uid === discardTarget.uid), true, "the discard goes to the AI graveyard");
+  assert.equal(resolved.ai.hand.some((card) => card.uid === drawTarget.uid), true, "the draw comes from the AI deck");
+  assert.equal(resolved.player.hand.length, playerHandBefore, "the player hand must stay untouched");
+});
+
+test("an AI-slot Cynthia grants Storm to AI-side fairy tokens only", () => {
+  const state = pairPlaying("levin", "fairy");
+  addField(state, "ai", "queenCynthia");
+  const aiToken = addField(state, "ai", "fairy");
+  const playerToken = addField(state, "player", "fairy");
+  assert.equal(hasKeyword(state, aiToken, "storm"), true);
+  assert.equal(hasKeyword(state, aiToken, "designated"), true);
+  assert.equal(hasKeyword(state, playerToken, "storm"), false, "the player token must not borrow the AI-side Cynthia");
+});
+
+test("an AI-slot Brutal Geno discounts by sacrificing an AI-side Levin follower", () => {
+  let state = pairPlaying("fairy", "levin", 11, false);
+  assert.equal(state.turnSide, "ai");
+  state.player.field = [];
+  state.ai.field = [];
+  state.ai.pp = 1;
+  state.ai.maxPP = 4;
+  const runes = addField(state, "ai", "levinRunes");
+  const geno = __testing.makeInstance(state, "brutalGeno", "ai", "hand");
+  state.ai.hand = [geno];
+  state = playCardForSide(state, "ai", geno.uid, "hand");
+  assert.equal(state.pending?.effect, "brutalGenoPlay");
+  assert.equal(state.pending?.side, "ai");
+  assert.deepEqual(state.pending?.options.map((option) => option.uid), [runes.uid], "only the AI-side cheap Levin follower is a legal sacrifice");
+  state = resolveChoice(state, [runes.uid]);
+  assert.equal(state.ai.field.some((card) => card.cardId === "brutalGeno"), true);
+  assert.equal(state.ai.grave.some((card) => card.uid === runes.uid), true, "the sacrifice lands in the AI graveyard");
+  assert.equal(state.ai.pp, 0, "the discounted cost is one PP");
+});
+
+test("a pair-mode replay records the AI deck and reconstructs the full game", () => {
+  let state = createGame(false, 4242, "levin", { aiControl: "manual", aiDeck: "fairy" });
+  let replay = createTrainingReplay(state);
+  assert.equal(replay.aiDeck, "fairy");
+  const rand = mulberry32(4242);
+  let decisions = 0;
+  while (state.status !== "gameover" && decisions < 500) {
+    const legal = trainingLegalActions(state);
+    const action = legal[Math.floor(rand() * legal.length)];
+    replay = recordTrainingDecision(replay, state, action);
+    state = applyTrainingAction(state, action);
+    decisions += 1;
+  }
+  replay = finalizeTrainingReplay(replay, state);
+  const reconstructed = replayTrainingGame(replay);
+  assert.deepEqual(reconstructed.finalState.events, state.events);
+  assert.equal(reconstructed.finalState.winner, state.winner);
+});
+
+// ───────────────────────── 雪華獸（セッカ）牌組 ─────────────────────────
+
+function sekkaPlaying(seed = 7): GameState {
+  return finishMulligan(createGame(true, seed, "sekka"), false);
+}
+
+test("the frozen card order is a strict prefix of TRAINING_CARD_IDS which covers every card exactly once", () => {
+  assert.ok(FROZEN_CARD_ORDER.length <= TRAINING_CARD_IDS.length);
+  FROZEN_CARD_ORDER.forEach((cardId, index) => {
+    assert.equal(TRAINING_CARD_IDS[index], cardId, `frozen index ${index} moved`);
+  });
+  assert.equal(new Set(TRAINING_CARD_IDS).size, TRAINING_CARD_IDS.length, "TRAINING_CARD_IDS contains duplicates");
+  assert.deepEqual([...TRAINING_CARD_IDS].sort(), Object.keys(CARDS).sort(), "TRAINING_CARD_IDS must cover CARDS exactly");
+});
+
+test("the Sekka deck lists 40 main and 10 evolve cards that all exist and carry the elf class trait", () => {
+  assert.equal(SEKKA_DECK.reduce((total, [, count]) => total + count, 0), 40);
+  assert.equal(SEKKA_EVOLVE.reduce((total, [, count]) => total + count, 0), 10);
+  assert.equal(PLAYER_DECKS.sekka.main, SEKKA_DECK);
+  assert.equal(PLAYER_DECKS.sekka.evolve, SEKKA_EVOLVE);
+  for (const [cardId] of [...SEKKA_DECK, ...SEKKA_EVOLVE]) {
+    assert.ok(CARDS[cardId], `${cardId} is missing from CARDS`);
+    assert.ok(CARDS[cardId].traits.includes("エルフ"), `${cardId} lacks the エルフ class trait`);
+  }
+  assert.ok(CARDS.greenManifest.traits.includes("エルフ"));
+  assert.equal(CARDS.greenManifest.token, true);
+  const state = createGame(true, 5, "sekka");
+  assert.equal(state.player.deck.length + state.player.hand.length, 40);
+  assert.equal(Object.values(state.player.evolveRemaining).reduce((a, b) => a + b, 0), 10);
+  assert.equal(state.player.evolveRemaining.sekkaAdvance, 3);
+});
+
+test("Foxfire Sekka ignites from the graveyard: pays 3PP, banishes three cards, and fields the Advance with its Fanfare", () => {
+  let state = sekkaPlaying();
+  state.player.field = [];
+  state.player.grave = [];
+  state.player.banished = [];
+  state.player.pp = 5;
+  const fox = __testing.makeInstance(state, "foxfireSekka", "player", "grave");
+  const costA = __testing.makeInstance(state, "owlman", "player", "grave");
+  const costB = __testing.makeInstance(state, "castel", "player", "grave");
+  state.player.grave.push(fox, costA, costB);
+
+  const ignite = cardActions(state, fox.uid, "grave").find((action) => action.id === "sekkaIgnite");
+  assert.equal(ignite?.enabled, true);
+  assert.ok(
+    trainingLegalActions(state).some((action) => action.kind === "activate" && action.abilityId === "sekkaIgnite" && action.uid === fox.uid),
+    "the training environment must enumerate graveyard activations",
+  );
+
+  state = activateFieldCard(state, fox.uid, "sekkaIgnite");
+  assert.equal(state.pending?.effect, "sekkaIgniteCost");
+  state = resolveChoice(state, [costA.uid, costB.uid]);
+  assert.equal(state.player.pp, 2, "3PP paid");
+  assert.equal(state.player.grave.length, 0);
+  assert.equal(state.player.banished.length, 3, "the fox and both costs are banished");
+  assert.equal(state.player.field.some((card) => card.cardId === "sekkaAdvance"), true);
+  assert.equal(state.player.evolveRemaining.sekkaAdvance, 2);
+  assert.equal(state.player.evolveUsed.sekkaAdvance, 1);
+
+  assert.equal(state.pending?.effect, "sekkaAdvanceMode", "the Advance Fanfare offers its two modes");
+  state = resolveChoice(state, ["deck"]);
+  assert.equal(state.pending?.effect, "sekkaAdvanceDeckPick");
+  const pick = state.pending!.options[0];
+  const rngBefore = state.rng;
+  state = resolveChoice(state, [pick.uid]);
+  assert.equal(state.player.hand.some((card) => card.uid === pick.uid && card.cardId === "ninetailResolve"), true);
+  assert.notEqual(state.rng, rngBefore, "the deck is shuffled after the search");
+});
+
+test("a graveyard Foxfire without 3PP, two extra cards, or an Advance copy cannot ignite", () => {
+  const state = sekkaPlaying();
+  state.player.grave = [];
+  const fox = __testing.makeInstance(state, "foxfireSekka", "player", "grave");
+  state.player.grave.push(fox);
+  state.player.pp = 5;
+  assert.equal(cardActions(state, fox.uid, "grave").find((action) => action.id === "sekkaIgnite")?.enabled, false, "needs two other grave cards");
+  state.player.grave.push(
+    __testing.makeInstance(state, "owlman", "player", "grave"),
+    __testing.makeInstance(state, "owlman", "player", "grave"),
+  );
+  state.player.pp = 2;
+  assert.equal(cardActions(state, fox.uid, "grave").find((action) => action.id === "sekkaIgnite")?.enabled, false, "needs 3PP");
+  state.player.pp = 5;
+  state.player.evolveRemaining.sekkaAdvance = 0;
+  assert.equal(cardActions(state, fox.uid, "grave").find((action) => action.id === "sekkaIgnite")?.enabled, false, "needs an Advance in the evolve zone");
+});
+
+test("Castel blocks ability damage for beast followers while combat damage still applies", () => {
+  let state = sekkaPlaying();
+  state.player.field = [];
+  state.ai.field = [];
+  const owl = addField(state, "player", "owlman");
+  const castel = addField(state, "player", "castel");
+  __testing.resolveTask(state, { type: "fanfare", side: "ai", cardId: "greatZelgenea" });
+  __testing.runTasks(state);
+  assert.equal(state.player.field.find((card) => card.uid === owl.uid)?.damage, 0, "the beast takes zero ability damage");
+  assert.equal(state.player.field.some((card) => card.uid === castel.uid), false, "Castel does not protect a same-named follower (itself)");
+
+  addField(state, "player", "castel");
+  const blocker = addField(state, "ai", "destructionServant");
+  blocker.tapped = true;
+  owl.enteredAt = state.globalTurn - 1;
+  state = attackCardForSide(state, "player", owl.uid, blocker.uid);
+  assert.equal(state.player.field.some((card) => card.uid === owl.uid), false, "combat damage ignores Castel");
+  assert.equal(state.ai.field.some((card) => card.uid === blocker.uid), false);
+});
+
+test("Sword Rabbit unlocks its zero-cost evolve after a bounce and can field a hand copy when it returns", () => {
+  let state = sekkaPlaying();
+  state.player.field = [];
+  state.player.hand = [];
+  const rabbit = addField(state, "player", "swordRabbit");
+  assert.equal(cardActions(state, rabbit.uid, "field").find((action) => action.id === "evolve-pp")?.enabled, false, "no bounce yet");
+
+  const carb = addField(state, "player", "babyCarbuncle");
+  state.player.deck.push(__testing.makeInstance(state, "owlman", "player", "deck"));
+  __testing.resolveTask(state, { type: "fanfare", side: "player", sourceUid: carb.uid, cardId: "babyCarbuncle" });
+  assert.equal(state.pending?.effect, "carbuncleBounce");
+  const handBefore = state.player.hand.length;
+  state = resolveChoice(state, [rabbit.uid]);
+  assert.equal(state.pending?.effect, "rabbitReturn", "the returned rabbit triggers its own replacement window");
+  assert.equal(state.player.hand.length, handBefore + 2, "the rabbit returned and the carbuncle drew one");
+  state = resolveChoice(state, [rabbit.uid]);
+  assert.equal(state.player.field.some((card) => card.uid === rabbit.uid), true, "a hand rabbit is fielded again");
+
+  state.player.pp = 0;
+  assert.equal(cardActions(state, rabbit.uid, "field").find((action) => action.id === "evolve-pp")?.enabled, true, "zero-cost evolve unlocked by the bounce");
+  state = evolveCard(state, rabbit.uid, "pp");
+  assert.equal(state.player.field.find((card) => card.uid === rabbit.uid)?.cardId, "swordRabbitEvo");
+});
+
+test("Salvia Panther costs three normally and one after another beast follower bounced this turn", () => {
+  let state = sekkaPlaying();
+  state.player.field = [];
+  const salvia = __testing.makeInstance(state, "salviaPanther", "player", "hand");
+  state.player.hand = [salvia];
+  state.player.pp = 1;
+  state.player.maxPP = 4;
+  assert.equal(cardActions(state, salvia.uid, "hand").find((action) => action.id === "play")?.enabled, false, "one PP is not enough without a bounce");
+
+  const owl = addField(state, "player", "owlman");
+  const carb = addField(state, "player", "babyCarbuncle");
+  state.player.deck.push(__testing.makeInstance(state, "castel", "player", "deck"));
+  __testing.resolveTask(state, { type: "fanfare", side: "player", sourceUid: carb.uid, cardId: "babyCarbuncle" });
+  state = resolveChoice(state, [owl.uid]);
+  assert.deepEqual(state.bouncedThisTurn.player, ["owlman"]);
+  const salviaInHand = state.player.hand.find((card) => card.uid === salvia.uid)!;
+  assert.equal(cardActions(state, salviaInHand.uid, "hand").find((action) => action.id === "play")?.enabled, true, "the discount enables the play at 1PP");
+  state = playCard(state, salviaInHand.uid, "hand");
+  assert.equal(state.player.field.some((card) => card.cardId === "salviaPanther"), true);
+  assert.equal(state.player.pp, 0, "the discounted cost is one PP");
+});
+
+test("Tiger Girl may banish three grave beasts after declaring an attack, then combat resolves either way", () => {
+  const setup = () => {
+    const state = sekkaPlaying();
+    state.player.field = [];
+    state.ai.field = [];
+    state.player.grave = [];
+    state.player.banished = [];
+    const tiger = addField(state, "player", "tigerGirl");
+    tiger.enteredAt = state.globalTurn - 1;
+    const target = addField(state, "ai", "destructionServant");
+    target.tapped = true;
+    const other = addField(state, "ai", "destructionFanatic");
+    for (let index = 0; index < 3; index += 1) {
+      state.player.grave.push(__testing.makeInstance(state, "owlman", "player", "grave"));
+    }
+    return { state, tiger, target, other };
+  };
+
+  // 發動線：先射掉另一體從者，戰鬥照常結算。
+  {
+    const { state, tiger, target, other } = setup();
+    let next = attackCardForSide(state, "player", tiger.uid, target.uid);
+    assert.equal(next.pending?.effect, "tigerGirlStrike");
+    next = resolveChoice(next, [other.uid]);
+    assert.equal(next.player.banished.length, 3, "three grave beasts are banished");
+    assert.equal(next.ai.field.some((card) => card.uid === other.uid), false, "the strike killed the 3/4");
+    assert.equal(next.ai.field.some((card) => card.uid === target.uid), false, "combat still killed the attack target");
+    const still = next.player.field.find((card) => card.uid === tiger.uid);
+    assert.equal(still?.damage, 2, "the tiger took combat damage back");
+    assert.equal(still?.tapped, true);
+  }
+
+  // 不發動線：pass 後戰鬥照常，墓場不動。
+  {
+    const { state, tiger, target, other } = setup();
+    let next = attackCardForSide(state, "player", tiger.uid, target.uid);
+    assert.equal(next.pending?.effect, "tigerGirlStrike");
+    next = resolveChoice(next, ["pass"]);
+    assert.equal(next.player.banished.length, 0);
+    assert.equal(next.player.grave.length, 3);
+    assert.equal(next.ai.field.some((card) => card.uid === other.uid), true, "the other follower survives");
+    assert.equal(next.ai.field.some((card) => card.uid === target.uid), false, "combat resolved normally");
+    assert.equal(next.player.field.find((card) => card.uid === tiger.uid)?.damage, 2);
+  }
+});
+
+test("Cetus refunds one PP per copy per turn when a beast card is played, and the flag resets next turn", () => {
+  let state = sekkaPlaying();
+  state.player.field = [];
+  addField(state, "player", "cetusSun");
+  state.player.pp = 5;
+  state.player.maxPP = 5;
+  const owlA = __testing.makeInstance(state, "owlman", "player", "hand");
+  const owlB = __testing.makeInstance(state, "owlman", "player", "hand");
+  state.player.hand = [owlA, owlB];
+
+  state = autoResolve(playCard(state, owlA.uid, "hand"));
+  assert.equal(state.player.pp, 5, "1PP paid and 1PP refunded (capped at maxPP)");
+  const cetus = state.player.field.find((card) => card.cardId === "cetusSun")!;
+  assert.equal(cetus.flags.cetusPpUsed, true);
+
+  state = autoResolve(playCard(state, owlB.uid, "hand"));
+  assert.equal(state.player.pp, 4, "the second beast play this turn is not refunded");
+
+  __testing.beginTurnMutable(state, "player");
+  assert.equal(state.player.field.find((card) => card.cardId === "cetusSun")?.flags.cetusPpUsed, undefined, "the per-turn flag resets");
+});
+
+function isFollowerInstance(card: CardInstance): boolean {
+  return CARDS[card.cardId].kind === "follower";
+}
+
+test("Green Manifest enforces the combined-cost-five limit in both enumeration and resolution", () => {
+  let state = sekkaPlaying();
+  state.player.field = [];
+  state.player.ex = [];
+  state.player.pp = 5;
+  state.player.maxPP = 5;
+  __testing.addExDirect(state, "player", ["greenManifest"]);
+  const green = state.player.ex[0];
+  const top = ["owlman", "castel", "cuttingCat", "cetusSun", "tigerGirl", "heroResolve", "ninetailResolve"]
+    .map((cardId) => __testing.makeInstance(state, cardId, "player", "deck"));
+  state.player.deck.push(...[...top].reverse());
+
+  state = playCard(state, green.uid, "ex");
+  assert.equal(state.pending?.effect, "greenManifestPick");
+  const optionUid = (cardId: string) => state.pending!.options.find((option) => option.cardId === cardId)!.uid;
+  const cetusUid = optionUid("cetusSun");
+  const cuttingUid = optionUid("cuttingCat");
+  const owlUid = optionUid("owlman");
+  const castelUid = optionUid("castel");
+
+  const keys = trainingLegalActions(state).map((action) => action.key);
+  assert.ok(!keys.some((key) => key.includes(cetusUid) && key.includes(cuttingUid)), "a 6-cost combination must not be enumerated");
+  assert.ok(keys.includes(`choice:${owlUid},${castelUid},${cuttingUid}`), "a 4-cost triple stays legal");
+  assert.ok(keys.includes(`choice:${cetusUid}`), "the 4-cost single stays legal");
+
+  const rejected = resolveChoice(state, [cetusUid, cuttingUid]);
+  assert.equal(rejected.pending?.effect, "greenManifestPick", "an over-cost selection is rejected and the choice stays open");
+
+  state = resolveChoice(state, [owlUid, cuttingUid]);
+  assert.equal(state.player.field.filter(isFollowerInstance).length, 2, "both picks entered the field");
+  assert.equal(state.pending?.effect, "bottomOrder");
+  state = autoResolve(state);
+  for (const card of state.player.field) {
+    assert.ok(card.attackBuff >= 1, `${card.cardId} should carry the +1/+1 from Green Manifest`);
+  }
+});
+
+test("fifty random Sekka-versus-Levin pair games advance without a stall or a throw", () => {
+  runRandomPairLeague("sekka", "levin");
+});
+
+test("fifty random Levin-versus-Sekka pair games advance without a stall or a throw", () => {
+  runRandomPairLeague("levin", "sekka");
 });

@@ -171,7 +171,7 @@ function ReplayCompactZone({ label, cards, hidden, side, state, leader = false }
 }
 
 function ReplayBattleBoard({ state, revealPlayer, revealAi }: { state: GameState; revealPlayer: boolean; revealAi: boolean }) {
-  const playerLabel = state.playerDeck === "levin" ? "雷維翁" : "妖精";
+  const playerLabel = state.playerDeck === "levin" ? "雷維翁" : state.playerDeck === "sekka" ? "雪華獸" : "妖精";
   return (
     <div className="replay-battle-board">
       <ReplayCompactZone label="破壞手牌" cards={state.ai.hand} hidden={!revealAi} side="ai" state={state} leader />
@@ -204,7 +204,7 @@ function DecisionPanel({ state, decision, events, perspective }: { state: GameSt
       <section>
         <p className="eyebrow">本格事件</p>
         <h2>雙方操作</h2>
-        {events.length ? <ol>{events.map((event) => <li key={event.seq}><span>{event.seq}</span><p>{eventLabel(event, perspective, state.playerDeck === "levin" ? "雷維翁" : "妖精")}</p></li>)}</ol> : <p className="replay-muted">本格沒有新增事件。</p>}
+        {events.length ? <ol>{events.map((event) => <li key={event.seq}><span>{event.seq}</span><p>{eventLabel(event, perspective, state.playerDeck === "levin" ? "雷維翁" : state.playerDeck === "sekka" ? "雪華獸" : "妖精")}</p></li>)}</ol> : <p className="replay-muted">本格沒有新增事件。</p>}
       </section>
       <section>
         <p className="eyebrow">下一個決策</p>
@@ -274,7 +274,7 @@ export default function ReplayViewer({ source, onClose }: { source: LoadedReplay
   const revealPlayer = perspective === "fairy" || perspective === "omniscient";
   const revealAi = perspective === "destruction" || perspective === "omniscient";
   const lastAction = step > 0 ? entry.replay.decisions[step - 1] : undefined;
-  const playerLabel = state.playerDeck === "levin" ? "雷維翁" : "妖精";
+  const playerLabel = state.playerDeck === "levin" ? "雷維翁" : state.playerDeck === "sekka" ? "雪華獸" : "妖精";
   const resultLabel = state.status === "mulligan" ? "換牌階段" : state.status === "gameover"
     ? state.winner === "player" ? `${playerLabel}勝利` : state.winner === "ai" ? "破壞勝利" : "平手"
     : `${state.turnSide === "player" ? playerLabel : "破壞"}第${state[state.turnSide].ownTurn}回合`;
