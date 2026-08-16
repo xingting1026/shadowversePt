@@ -196,7 +196,9 @@ function SetupScreen({
       <section className="setup-card">
         <div className="setup-card__mark">{deck === "levin" ? "L / W" : deck === "sekka" ? "S / W" : "F / W"}</div>
         <p className="eyebrow">SHADOWVERSE EVOLVE · 對局練習室</p>
-        <h1>{deck === "levin" ? "雷維翁 vs. 破壊" : deck === "sekka" ? "雪華獸 vs. 破壊" : "妖精 vs. 破壊"}</h1>
+        <h1 className={`setup-title ${deck === "fairy" ? "" : "setup-title--long"}`}>
+          {deck === "levin" ? "雷維翁 vs. 破壊" : deck === "sekka" ? "雪華獸 vs. 破壊" : "妖精 vs. 破壊"}
+        </h1>
         <p className="setup-card__lead">
           {deck === "levin"
             ? "1KUUZE雷維翁皇家牌組：靠棄牌與磨牌把雷維翁堆進墓場，5張開啟全隊強化，アルベール一回合多段疾走收尾。對手是52人賽冠軍破壞巫。"
