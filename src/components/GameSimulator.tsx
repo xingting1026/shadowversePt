@@ -195,7 +195,7 @@ function SetupScreen({
     <main className="setup-shell">
       <section className="setup-card">
         <div className="setup-card__mark">{deck === "levin" ? "L / W" : deck === "sekka" ? "S / W" : "F / W"}</div>
-        <p className="eyebrow">SHADOWVERSE EVOLVE · 對局研究室</p>
+        <p className="eyebrow">SHADOWVERSE EVOLVE · 對局練習室</p>
         <h1>{deck === "levin" ? "雷維翁 vs. 破壊" : deck === "sekka" ? "雪華獸 vs. 破壊" : "妖精 vs. 破壊"}</h1>
         <p className="setup-card__lead">
           {deck === "levin"
