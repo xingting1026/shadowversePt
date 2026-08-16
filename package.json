@@ -10,10 +10,13 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "bench:training": "node --require ./training/tsx-user-shim.cjs --import tsx training-bench.ts",
+    "verify:model": "node --require ./training/tsx-user-shim.cjs --import tsx training-browser-parity.ts",
     "test": "npm run build && npm run test:engine",
-    "test:engine": "tsx --test tests/game-engine.test.ts"
+    "test:engine": "node --require ./training/tsx-user-shim.cjs --import tsx --test tests/game-engine.test.ts"
   },
   "dependencies": {
+    "onnxruntime-web": "^1.27.0",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },

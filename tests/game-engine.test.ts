@@ -6,16 +6,37 @@ import {
   attackTargets,
   cardActions,
   createGame,
+  definition,
   endTurn,
+  finishManualMulligan,
   finishMulligan,
   hasKeyword,
   playCard,
   resolveChoice,
+  restartWithSameSeed,
   type CardInstance,
   type GameState,
   type Zone,
 } from "../src/game/engine.ts";
 import { isLevinCard } from "../src/game/cards.ts";
+import {
+  applyTrainingAction,
+  createTrainingReplay,
+  finalizeTrainingReplay,
+  recordTrainingDecision,
+  replayTrainingGame,
+  trainingLegalActions,
+  trainingObservation,
+  trainingActor,
+  trainingReward,
+  type TrainingAction,
+} from "../src/game/training.ts";
+import {
+  encodeTrainingAction,
+  encodeTrainingState,
+  TRAINING_ENCODING_METADATA,
+} from "../src/game/training-encoding.ts";
+import { buildBrowserPolicyInputs } from "../src/game/browser-policy-input.ts";
 
 function playing(seed = 7): GameState {
   return finishMulligan(createGame(true, seed), false);
@@ -33,6 +54,271 @@ test("fixed lists contain 40 main cards and 10 evolve cards", () => {
   assert.equal(state.ai.deck.length + state.ai.hand.length, 40);
   assert.equal(Object.values(state.player.evolveRemaining).reduce((a, b) => a + b, 0), 10);
   assert.equal(Object.values(state.ai.evolveRemaining).reduce((a, b) => a + b, 0), 10);
+});
+
+test("seed mixing keeps replays deterministic while decorrelating neighboring seeds", () => {
+  const signature = (seed: number) => {
+    const state = createGame(true, seed, "fairy");
+    return [...state.player.hand, ...state.ai.hand].map((card) => card.cardId).join(",");
+  };
+  assert.equal(signature(50_000_000), signature(50_000_000));
+  const signatures = new Set(Array.from({ length: 64 }, (_, index) => signature(50_000_000 + index)));
+  assert.ok(signatures.size >= 60, `neighboring seeds produced only ${signatures.size} distinct openings`);
+});
+
+test("the training observation exposes the player's hand but never the AI hand or either deck order", () => {
+  const state = createGame(true, 123);
+  const observation = trainingObservation(state);
+  assert.equal(observation.self.hand?.length, 4);
+  assert.equal(observation.opponent.hand, undefined);
+  assert.equal(observation.self.deckCount, 36);
+  assert.equal(observation.opponent.deckCount, 36);
+  assert.equal("deck" in observation.self, false);
+  assert.equal("deck" in observation.opponent, false);
+  assert.equal(Object.values(observation.ownDeckList).reduce((sum, count) => sum + count, 0), 40);
+  assert.equal(Object.values(observation.opponentDeckList).reduce((sum, count) => sum + count, 0), 40);
+});
+
+test("the neural encoding is fixed-size and invariant to hidden deck order and opponent hidden-card allocation", () => {
+  const state = createGame(true, 456, "fairy");
+  const encoded = encodeTrainingState(state);
+  assert.equal(encoded.scalars.length, TRAINING_ENCODING_METADATA.scalarSize);
+  assert.equal(encoded.zones.length, TRAINING_ENCODING_METADATA.zoneNames.length);
+  assert.ok(encoded.field.length <= TRAINING_ENCODING_METADATA.fieldSlots);
+  assert.ok(encoded.recentEvents.length <= TRAINING_ENCODING_METADATA.recentEventSlots);
+
+  const reordered = structuredClone(state);
+  reordered.player.deck.reverse();
+  assert.deepEqual(encodeTrainingState(reordered), encoded);
+
+  const opponentHiddenSwap = structuredClone(state);
+  const handCard = opponentHiddenSwap.ai.hand[0];
+  const deckCard = opponentHiddenSwap.ai.deck[0];
+  opponentHiddenSwap.ai.hand[0] = deckCard;
+  deckCard.zone = "hand";
+  opponentHiddenSwap.ai.deck[0] = handCard;
+  handCard.zone = "deck";
+  assert.deepEqual(encodeTrainingState(opponentHiddenSwap), encoded);
+
+  for (const action of trainingLegalActions(state)) {
+    const actionEncoding = encodeTrainingAction(state, action);
+    assert.equal(actionEncoding.numbers.length, TRAINING_ENCODING_METADATA.actionNumberSize);
+    assert.ok(actionEncoding.selectedCards.length <= TRAINING_ENCODING_METADATA.actionSelectionSlots);
+    assert.ok(actionEncoding.selectedSpecials.length <= TRAINING_ENCODING_METADATA.actionSelectionSlots);
+  }
+});
+
+test("browser policy tensors match the training tensor schema on a real AI mulligan", () => {
+  let state = createGame(false, 20260816, "levin", { aiControl: "manual" });
+  state = finishManualMulligan(state, "player", false);
+  assert.equal(trainingActor(state), "ai");
+  const actions = trainingLegalActions(state);
+  const inputs = buildBrowserPolicyInputs(state, actions);
+  assert.deepEqual(inputs.scalars.dims, [1, TRAINING_ENCODING_METADATA.scalarSize]);
+  assert.deepEqual(inputs.zone_counts.dims, [1, TRAINING_ENCODING_METADATA.zoneNames.length, TRAINING_ENCODING_METADATA.cardVocabularySize]);
+  assert.deepEqual(inputs.field_numbers.dims, [1, TRAINING_ENCODING_METADATA.fieldSlots, TRAINING_ENCODING_METADATA.fieldNumberSize]);
+  assert.deepEqual(inputs.numbers.dims, [1, actions.length, TRAINING_ENCODING_METADATA.actionNumberSize]);
+  assert.deepEqual(inputs.mask.dims, [1, actions.length]);
+  assert.deepEqual(Array.from(inputs.mask.data as Uint8Array), new Array(actions.length).fill(1));
+  const actionNumbers = Array.from(inputs.numbers.data as Float32Array);
+  assert.equal(actionNumbers[12], 0, "keep action must encode redraw=false");
+  assert.equal(actionNumbers[TRAINING_ENCODING_METADATA.actionNumberSize + 12], 1, "redraw action must encode redraw=true");
+
+  const restarted = restartWithSameSeed(state);
+  assert.equal(restarted.aiControl, "manual", "a model game must not silently restart with scripted AI");
+});
+
+test("the training environment enumerates mulligan, ordered choices, and optional subsets", () => {
+  let state = createGame(true, 123);
+  assert.deepEqual(trainingLegalActions(state).map((action) => action.key), ["mulligan:player:keep", "mulligan:player:redraw"]);
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  state.pending = {
+    kind: "order",
+    effect: "testOrder",
+    title: "測試排序",
+    prompt: "排序三張卡",
+    options: [
+      { uid: "a", label: "A" },
+      { uid: "b", label: "B" },
+      { uid: "c", label: "C" },
+    ],
+    min: 3,
+    max: 3,
+  };
+  assert.equal(trainingLegalActions(state).length, 6);
+  state.pending = {
+    kind: "multi",
+    effect: "testSubset",
+    title: "測試子集",
+    prompt: "任選",
+    options: [{ uid: "a" }, { uid: "b" }, { uid: "c" }],
+    min: 0,
+    max: 3,
+  };
+  assert.equal(trainingLegalActions(state).length, 8);
+});
+
+test("manual-AI matches wait for both mulligans and expose the Destruction turn instead of auto-playing it", () => {
+  let state = createGame(false, 8080, "fairy", { aiControl: "manual" });
+  assert.deepEqual(trainingLegalActions(state).map((action) => action.key), ["mulligan:player:keep", "mulligan:player:redraw"]);
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  assert.equal(state.status, "mulligan");
+  assert.deepEqual(trainingLegalActions(state).map((action) => action.key), ["mulligan:ai:keep", "mulligan:ai:redraw"]);
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  assert.equal(state.status, "playing");
+  assert.equal(state.turnSide, "ai");
+  assert.equal(state.phase, "main");
+  assert.equal(state.events.filter((event) => event.type === "play").length, 0);
+  assert.ok(trainingLegalActions(state).some((action) => action.kind === "end" && action.key === "end:ai"));
+  assert.equal(trainingObservation(state).actor, "ai");
+  assert.deepEqual(trainingObservation(state).self.hand, state.ai.hand.map((card) => card.cardId));
+  assert.equal(trainingObservation(state).opponent.hand, undefined);
+});
+
+test("manual Destruction policy receives explicit play, attack-target, and compound activation candidates", () => {
+  let state = createGame(false, 8181, "fairy", { aiControl: "manual" });
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  state.ai.pp = 10;
+  state.ai.maxPP = 10;
+  state.ai.hand = [__testing.makeInstance(state, "destructionJoy", "ai", "hand")];
+  const play = trainingLegalActions(state).find((action) => action.kind === "play");
+  assert.ok(play);
+  state = applyTrainingAction(state, play);
+  assert.equal(state.events.at(-1)?.side, "ai");
+
+  const prayer = addField(state, "ai", "destructionPrayer");
+  const sacrifice = addField(state, "ai", "destructionWilderness");
+  const attacker = addField(state, "ai", "destructionHermit");
+  attacker.enteredAt = state.globalTurn - 1;
+  const target = addField(state, "player", "pureWaterFairy");
+  target.tapped = true;
+  const actions = trainingLegalActions(state);
+  assert.ok(actions.some((action) => action.kind === "attack" && action.uid === attacker.uid && action.targetUid === target.uid));
+  const prayerHit = actions.find((action) =>
+    action.kind === "activate" && action.abilityId === "prayer"
+    && action.uid === prayer.uid && action.selected?.includes(sacrifice.uid) && action.selected?.includes(target.uid));
+  assert.ok(prayerHit);
+  state = applyTrainingAction(state, prayerHit);
+  assert.equal(prayer.tapped, false, "the original input remains immutable");
+  assert.equal(state.ai.field.find((card) => card.uid === prayer.uid)?.tapped, true);
+  assert.equal(state.ai.field.some((card) => card.uid === sacrifice.uid), false);
+});
+
+test("manual Destruction answers its own Quick window and can remove an attacker before combat", () => {
+  let state = createGame(true, 8282, "fairy", { aiControl: "manual" });
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  state.player.field = [];
+  state.ai.field = [];
+  state.ai.hand = [__testing.makeInstance(state, "whiteBlackChapter", "ai", "hand")];
+  state.ai.pp = 2;
+  const attacker = addField(state, "player", "pureWaterFairy");
+  attacker.enteredAt = state.globalTurn - 1;
+  const attack = trainingLegalActions(state).find((action) => action.kind === "attack" && action.targetUid === "ai-leader");
+  assert.ok(attack);
+  state = applyTrainingAction(state, attack);
+  assert.equal(state.pending?.effect, "manualAiQuick");
+  assert.equal(trainingActor(state), "ai");
+  const quick = trainingLegalActions(state).find((action) => action.kind === "choice" && action.selected[0] === attacker.uid);
+  assert.ok(quick);
+  state = applyTrainingAction(state, quick);
+  assert.equal(state.player.field.some((card) => card.uid === attacker.uid), false);
+  assert.equal(state.ai.hp, 20, "a removed attacker does not deal combat damage");
+});
+
+test("manual Destruction fanfares expose target selection to the Destruction actor", () => {
+  let state = createGame(false, 8383, "fairy", { aiControl: "manual" });
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  state = applyTrainingAction(state, trainingLegalActions(state)[0]);
+  state.ai.field = [];
+  state.ai.hand = [__testing.makeInstance(state, "destructionHermit", "ai", "hand")];
+  state.ai.pp = 5;
+  addField(state, "ai", "destructionWilderness");
+  addField(state, "ai", "destructionPrayer");
+  const targetA = addField(state, "player", "fairyDragon");
+  const targetB = addField(state, "player", "pureWaterFairy");
+  const play = trainingLegalActions(state).find((action) => action.kind === "play" && action.cardId === "destructionHermit");
+  assert.ok(play);
+  state = applyTrainingAction(state, play);
+  assert.equal(state.pending?.effect, "manualHermitTarget");
+  assert.equal(trainingActor(state), "ai");
+  const chooseB = trainingLegalActions(state).find((action) => action.kind === "choice" && action.selected[0] === targetB.uid);
+  assert.ok(chooseB);
+  state = applyTrainingAction(state, chooseB);
+  assert.ok(state.player.field.some((card) => card.uid === targetA.uid));
+  assert.equal(state.player.field.some((card) => card.uid === targetB.uid), false);
+});
+
+function baselineTrainingAction(actions: TrainingAction[]): TrainingAction {
+  const choice = actions.find((action) => action.kind === "choice");
+  if (choice) return choice;
+  const play = actions
+    .filter((action): action is Extract<TrainingAction, { kind: "play" }> => action.kind === "play")
+    .sort((a, b) => definition(b.cardId).cost - definition(a.cardId).cost)[0];
+  if (play) return play;
+  const evolve = actions.find((action) => action.kind === "evolve");
+  if (evolve) return evolve;
+  const attack = actions.find((action) => action.kind === "activate" && action.abilityId === "attack");
+  if (attack) return attack;
+  const activate = actions.find((action) => action.kind === "activate");
+  if (activate) return activate;
+  const mulligan = actions.find((action) => action.kind === "mulligan" && !action.redraw);
+  if (mulligan) return mulligan;
+  const end = actions.find((action) => action.kind === "end");
+  if (end) return end;
+  throw new Error("training environment returned no selectable action");
+}
+
+test("headless Fairy versus Destruction games can run to completion through only the training API", () => {
+  for (let seed = 1; seed <= 12; seed += 1) {
+    let state = createGame(seed % 2 === 0, seed, "fairy");
+    let decisions = 0;
+    while (state.status !== "gameover" && decisions < 400) {
+      const actions = trainingLegalActions(state);
+      assert.ok(actions.length > 0, `seed ${seed} has no legal training action`);
+      state = applyTrainingAction(state, baselineTrainingAction(actions));
+      decisions += 1;
+    }
+    assert.equal(state.status, "gameover", `seed ${seed} did not finish`);
+    assert.ok([-1, 0, 1].includes(trainingReward(state)));
+  }
+});
+
+test("a training replay reconstructs both sides' events and rejects a divergent action set", () => {
+  let state = createGame(false, 90210, "fairy");
+  let replay = createTrainingReplay(state);
+  let decisions = 0;
+  while (state.status !== "gameover" && decisions < 400) {
+    const legal = trainingLegalActions(state);
+    const action = baselineTrainingAction(legal);
+    replay = recordTrainingDecision(replay, state, action, {
+      value: 0,
+      policy: [{ actionKey: action.key, probability: 1 }],
+    });
+    state = applyTrainingAction(state, action);
+    decisions += 1;
+  }
+  assert.equal(state.status, "gameover");
+  replay = finalizeTrainingReplay(replay, state);
+
+  const reconstructed = replayTrainingGame(replay);
+  assert.equal(reconstructed.states.length, replay.decisions.length + 1);
+  assert.deepEqual(reconstructed.finalState.events, state.events);
+  assert.deepEqual(reconstructed.finalState.log, state.log);
+  assert.deepEqual(replay.result, {
+    status: state.status,
+    winner: state.winner,
+    reward: trainingReward(state),
+    globalTurn: state.globalTurn,
+    playerHp: state.player.hp,
+    aiHp: state.ai.hp,
+    eventCount: state.events.length,
+  });
+
+  const divergent = structuredClone(replay);
+  divergent.decisions[0].legalActionKeys.push("impossible-action");
+  assert.throws(() => replayTrainingGame(divergent), /legal actions diverged/);
 });
 
 test("a follower put directly from outside the field still resolves Fanfare", () => {
@@ -427,6 +713,52 @@ test("the Quick window is not wasted on a cheap token attacker", () => {
   const amatsu = addField(state, "player", "fairyBladeAmatsu");
   __testing.aiQuickWindow(state, amatsu);
   assert.equal(state.ai.hand.length, 0, "chapter should still answer a real threat");
+});
+
+test("a Last Words choice caused by end-phase Quick resolves before the AI turn continues", () => {
+  let state = playing(1002629);
+  state.player.field = [];
+  state.ai.field = [];
+  state.ai.hand = [];
+  state.ai.pp = 2;
+  const aria = addField(state, "player", "miasmaAriaEvo");
+  aria.baseCardId = "miasmaAria";
+  aria.damage = Math.max(0, (definition(aria).health ?? 0) - 2);
+  const quick = __testing.makeInstance(state, "whiteBlackChapter", "ai", "hand");
+  state.ai.hand.push(quick);
+
+  state = endTurn(state);
+  assert.equal(state.turnSide, "player");
+  assert.equal(state.pending?.effect, "miasmaLastWord");
+
+  state = resolveChoice(state, ["no"]);
+  assert.equal(state.turnSide, "player");
+  assert.equal(state.phase, "main");
+  assert.equal(state.pending, undefined);
+});
+
+test("a discard trigger caused by the hand limit resolves before the AI turn continues", () => {
+  let state = playing(1001519);
+  state.player.field = [];
+  state.ai.field = [];
+  state.ai.hand = [];
+  const geno = __testing.makeInstance(state, "levinAxeGeno", "player", "hand");
+  state.player.hand.push(geno);
+  while (state.player.hand.length < 8) {
+    state.player.hand.push(__testing.makeInstance(state, "levinMiim", "player", "hand"));
+  }
+  state.player.deck.push(__testing.makeInstance(state, "levinMiim", "player", "deck"));
+
+  state = endTurn(state);
+  assert.equal(state.pending?.effect, "discardToSeven");
+  state = resolveChoice(state, [geno.uid]);
+  assert.equal(state.turnSide, "player");
+  assert.equal(state.pending?.effect, "genoDigPick");
+
+  state = resolveChoice(state, []);
+  assert.equal(state.turnSide, "player");
+  assert.equal(state.phase, "main");
+  assert.equal(state.pending, undefined);
 });
 
 test("the prayer channels burn at the leader while racing", () => {

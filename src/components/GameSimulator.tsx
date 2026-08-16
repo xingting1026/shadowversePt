@@ -8,7 +8,7 @@ import {
   definition,
   endTurn,
   evolveCard,
-  finishMulligan,
+  finishManualMulligan,
   maxHealthOf,
   playCard,
   remainingHealthOf,
@@ -19,6 +19,9 @@ import {
   type PendingChoice,
   type Zone,
 } from "../game/engine";
+import { loadDestructionPolicy, type DestructionPolicy } from "../game/destruction-policy";
+import { applyTrainingAction, trainingActor } from "../game/training";
+import ReplayViewer, { parseReplayFile, ReplayLoadButton, type LoadedReplaySet } from "./ReplayViewer";
 
 type SelectedCard = { uid: string; zone: Zone; side: Side };
 type ZoneDrawer = { title: string; cards: CardInstance[]; side: Side; zone: Zone; note?: string };
@@ -105,7 +108,7 @@ function PlayerVitals({ state, side }: { state: GameState; side: Side }) {
   return (
     <div className={`vitals ${side === "ai" ? "vitals--ai" : "vitals--player"}`}>
       <div className="vitals__identity">
-        <span className="vitals__eyebrow">{side === "ai" ? "規則型對手" : "玩家 · 7P9XP"}</span>
+        <span className="vitals__eyebrow">{side === "ai" ? "cycle 13 對抗模型" : `玩家 · ${state.playerDeck === "levin" ? "1KUUZE" : "7P9XP"}`}</span>
         <strong>{side === "ai" ? "破壊ウィッチ" : PLAYER_DECKS[state.playerDeck].label}</strong>
       </div>
       <div className="vitals__stats">
@@ -173,7 +176,19 @@ function HandBacks({ count }: { count: number }) {
   );
 }
 
-function SetupScreen({ onStart }: { onStart: (first: boolean, seed: number, deck: PlayerDeckId) => void }) {
+function SetupScreen({
+  onStart,
+  onReplay,
+  policy,
+  policyError,
+  onRetry,
+}: {
+  onStart: (first: boolean, seed: number, deck: PlayerDeckId) => void;
+  onReplay: (source: LoadedReplaySet) => void;
+  policy: DestructionPolicy | null;
+  policyError: string | null;
+  onRetry: () => void;
+}) {
   const [seed, setSeed] = useState(() => Math.floor(Date.now() % 2_147_483_647));
   const [deck, setDeck] = useState<PlayerDeckId>("fairy");
   return (
@@ -185,8 +200,16 @@ function SetupScreen({ onStart }: { onStart: (first: boolean, seed: number, deck
         <p className="setup-card__lead">
           {deck === "levin"
             ? "1KUUZE雷維翁皇家牌組：靠棄牌與磨牌把雷維翁堆進墓場，5張開啟全隊強化，アルベール一回合多段疾走收尾。對手是52人賽冠軍破壞巫。"
-            : "固定7P9XP妖精牌組，對戰52人賽冠軍5JK33破壞巫。你做每一個妖精決策，對手依局面評分自動採取最優規則行動。"}
+            : "固定7P9XP妖精牌組，對戰52人賽冠軍5JK33破壞巫。你操作妖精，對手由妖精與雷維翁共同對抗訓練的破壞模型操作。"}
         </p>
+        <div className={`model-status ${policyError ? "is-error" : policy ? "is-ready" : "is-loading"}`} role="status">
+          <span className="model-status__dot" />
+          <div>
+            <strong>{policyError ? "模型載入失敗" : policy ? `破壞模型 cycle ${policy.manifest.cycle} 已就緒` : "正在載入破壞模型…"}</strong>
+            <small>{policyError ?? (policy ? "engine v3 · 自我對抗聯賽 · 瀏覽器本機推論" : "首次開啟需下載約 4 MB 模型")}</small>
+          </div>
+          {policyError ? <button type="button" onClick={onRetry}>重試</button> : null}
+        </div>
         <div className="setup-actions" role="radiogroup" aria-label="選擇牌組">
           <button
             type="button"
@@ -206,11 +229,12 @@ function SetupScreen({ onStart }: { onStart: (first: boolean, seed: number, deck
           <input type="number" value={seed} onChange={(event) => setSeed(Number(event.target.value) || 1)} />
         </label>
         <div className="setup-actions">
-          <button type="button" className="primary-button" onClick={() => onStart(true, seed, deck)}>我方先攻</button>
-          <button type="button" className="secondary-button" onClick={() => onStart(false, seed, deck)}>我方後攻</button>
+          <button type="button" className="primary-button" disabled={!policy} onClick={() => onStart(true, seed, deck)}>我方先攻</button>
+          <button type="button" className="secondary-button" disabled={!policy} onClick={() => onStart(false, seed, deck)}>我方後攻</button>
         </div>
+        {import.meta.env.DEV ? <ReplayLoadButton onLoad={onReplay} /> : null}
         <div className="setup-card__facts">
-          <span>完整卡圖與效果詳情</span><span>重新整理即開始新對局</span><span>相同亂數種子可重播</span>
+          <span>完整卡圖與效果詳情</span><span>cycle 13 模型本機推論</span><span>相同亂數種子可驗證</span>
         </div>
       </section>
     </main>
@@ -231,6 +255,19 @@ function MulliganScreen({ state, onKeep, onRedraw, onInspect }: { state: GameSta
           <button type="button" className="primary-button" onClick={onKeep}>保留起手</button>
           <button type="button" className="secondary-button" onClick={onRedraw}>全部重抽</button>
         </div>
+      </section>
+    </main>
+  );
+}
+
+function AiMulliganScreen({ error }: { error: string | null }) {
+  return (
+    <main className="mulligan-shell">
+      <section className="mulligan-panel mulligan-panel--thinking" role="status">
+        <p className="eyebrow">破壞模型 · 起手決策</p>
+        <h1>{error ? "模型暫停" : "破壞巫正在判斷留牌…"}</h1>
+        <p>{error ?? "模型只看到自己的手牌與公開資訊，不會讀取你的手牌。"}</p>
+        {!error ? <span className="thinking-pulse" /> : null}
       </section>
     </main>
   );
@@ -376,10 +413,47 @@ function Drawer({ drawer, onClose, onSelect }: { drawer: ZoneDrawer; onClose: ()
 
 export default function GameSimulator() {
   const [state, setState] = useState<GameState | null>(null);
+  const [replaySource, setReplaySource] = useState<LoadedReplaySet | null>(null);
+  const [policy, setPolicy] = useState<DestructionPolicy | null>(null);
+  const [policyError, setPolicyError] = useState<string | null>(null);
+  const [aiStatus, setAiStatus] = useState("AI 思考中");
   const [selected, setSelected] = useState<SelectedCard | null>(null);
   const [drawer, setDrawer] = useState<ZoneDrawer | null>(null);
-  const [showLog, setShowLog] = useState(true);
+  const [showLog, setShowLog] = useState(import.meta.env.DEV);
   const sentRef = useRef({ gameId: "", count: 0 });
+
+  const beginPolicyLoad = () => {
+    setPolicyError(null);
+    void loadDestructionPolicy()
+      .then(setPolicy)
+      .catch((reason: unknown) => setPolicyError(reason instanceof Error ? reason.message : String(reason)));
+  };
+
+  useEffect(() => {
+    beginPolicyLoad();
+  }, []);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const replayPath = new URLSearchParams(window.location.search).get("replay");
+    if (!replayPath) return;
+    const target = new URL(replayPath, window.location.href);
+    if (target.origin !== window.location.origin || !target.pathname.endsWith(".json")) return;
+    const controller = new AbortController();
+    void fetch(target, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`回放讀取失敗：HTTP ${response.status}`);
+        return response.json() as Promise<unknown>;
+      })
+      .then((value) => {
+        setReplaySource(parseReplayFile(value, target.pathname.split("/").at(-1) ?? "replay.json"));
+      })
+      .catch((reason: unknown) => {
+        if (reason instanceof DOMException && reason.name === "AbortError") return;
+        console.error(reason);
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     if (!state || !import.meta.env.DEV) return;
@@ -394,14 +468,41 @@ export default function GameSimulator() {
     }).catch(() => {});
   }, [state]);
 
+  useEffect(() => {
+    if (!state || !policy || trainingActor(state) !== "ai" || policyError) return;
+    let cancelled = false;
+    const decisionState = state;
+    const timer = window.setTimeout(() => {
+      setAiStatus(state.status === "mulligan" ? "AI 判斷留牌中" : "AI 計算最佳動作中");
+      void policy.choose(decisionState)
+        .then((decision) => {
+          if (cancelled) return;
+          setAiStatus(`${decision.action.label} · ${decision.inferenceMs.toFixed(0)}ms`);
+          setState((current) => current === decisionState ? applyTrainingAction(current, decision.action) : current);
+        })
+        .catch((reason: unknown) => {
+          if (cancelled) return;
+          setPolicyError(reason instanceof Error ? reason.message : String(reason));
+        });
+    }, 180);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [state, policy, policyError]);
+
   const turnLabel = useMemo(() => {
     if (!state) return "";
     if (state.status === "gameover") return state.winner === "player" ? "勝利" : state.winner === "ai" ? "敗北" : "平手";
     return state.turnSide === "player" ? `你的第${state.player.ownTurn}回合` : `破壞巫第${state.ai.ownTurn}回合`;
   }, [state]);
 
-  if (!state) return <SetupScreen onStart={(first, seed, deck) => setState(createGame(first, seed, deck))} />;
-  if (state.status === "mulligan") return <><MulliganScreen state={state} onKeep={() => setState(finishMulligan(state, false))} onRedraw={() => setState(finishMulligan(state, true))} onInspect={setSelected} />{selected ? <CardDetail state={state} selection={selected} onClose={() => setSelected(null)} setState={setState} /> : null}</>;
+  if (import.meta.env.DEV && replaySource) return <ReplayViewer source={replaySource} onClose={() => setReplaySource(null)} />;
+  if (!state) return <SetupScreen onStart={(first, seed, deck) => { setPolicyError(null); setState(createGame(first, seed, deck, { aiControl: "manual" })); }} onReplay={setReplaySource} policy={policy} policyError={policyError} onRetry={beginPolicyLoad} />;
+  if (state.status === "mulligan") {
+    if (trainingActor(state) === "ai") return <AiMulliganScreen error={policyError} />;
+    return <><MulliganScreen state={state} onKeep={() => setState(finishManualMulligan(state, "player", false))} onRedraw={() => setState(finishManualMulligan(state, "player", true))} onInspect={setSelected} />{selected ? <CardDetail state={state} selection={selected} onClose={() => setSelected(null)} setState={setState} /> : null}</>;
+  }
 
   return (
     <main className="game-shell">
@@ -416,13 +517,14 @@ export default function GameSimulator() {
           <small>亂數種子 {state.seed}</small>
         </div>
         <div className="header-actions">
-          <button type="button" onClick={() => setShowLog((value) => !value)}>{showLog ? "隱藏紀錄" : "顯示紀錄"}</button>
+          {import.meta.env.DEV ? <button type="button" onClick={() => setShowLog((value) => !value)}>{showLog ? "隱藏紀錄" : "顯示紀錄"}</button> : null}
           <button type="button" onClick={() => { setState(restartWithSameSeed(state)); setSelected(null); }}>同亂數種子重開</button>
           <button type="button" onClick={() => { setState(null); setSelected(null); }}>新對局</button>
         </div>
       </header>
 
-      <section className={`game-layout ${showLog ? "has-log" : ""}`}>
+      {policyError ? <div className="model-error-banner" role="alert"><strong>破壞模型已暫停</strong><span>{policyError}</span></div> : null}
+      <section className={`game-layout ${import.meta.env.DEV && showLog ? "has-log" : ""}`}>
         <div className="board-column">
           <section className="player-board player-board--ai">
             <PlayerVitals state={state} side="ai" />
@@ -448,7 +550,7 @@ export default function GameSimulator() {
               <div className="zone-label"><span>EX區</span><small>{state.player.ex.length}/5 · 可直接使用</small></div>
               <CardRow cards={state.player.ex} side="player" zone="ex" onSelect={setSelected} empty="EX區目前沒有卡片" />
             </div>
-            <div className="board-tools"><ZoneButtons state={state} side="player" openDrawer={setDrawer} />{state.turnSide === "player" && state.phase === "main" && !state.pending ? <button type="button" className="end-turn-button" onClick={() => setState(endTurn(state))}>結束回合</button> : <span className="waiting-pill">{state.turnSide === "ai" ? "AI思考中" : "正在處理效果"}</span>}</div>
+            <div className="board-tools"><ZoneButtons state={state} side="player" openDrawer={setDrawer} />{trainingActor(state) === "player" && state.turnSide === "player" && state.phase === "main" && !state.pending ? <button type="button" className="end-turn-button" onClick={() => setState(endTurn(state))}>結束回合</button> : <span className="waiting-pill">{trainingActor(state) === "ai" ? aiStatus : "正在處理效果"}</span>}</div>
             <PlayerVitals state={state} side="player" />
           </section>
 
@@ -458,7 +560,7 @@ export default function GameSimulator() {
           </section>
         </div>
 
-        {showLog ? (
+        {import.meta.env.DEV && showLog ? (
           <aside className="log-panel">
             <div className="log-panel__heading"><p className="eyebrow">行動紀錄</p><h2>對局紀錄</h2></div>
             <ol>{state.log.map((entry, index) => <li key={`${index}-${entry}`} className={index === 0 ? "is-latest" : ""}><span>{state.log.length - index}</span><p>{entry}</p></li>)}</ol>
@@ -467,7 +569,7 @@ export default function GameSimulator() {
         ) : null}
       </section>
 
-      {state.pending ? <PendingModal key={`${state.pending.effect}-${state.pending.title}-${state.pending.options.map((option) => option.uid).join("|")}`} pending={state.pending} onResolve={(uids) => setState(resolveChoice(state, uids))} /> : null}
+      {state.pending && trainingActor(state) === "player" ? <PendingModal key={`${state.pending.effect}-${state.pending.title}-${state.pending.options.map((option) => option.uid).join("|")}`} pending={state.pending} onResolve={(uids) => setState(resolveChoice(state, uids))} /> : null}
       {selected ? <CardDetail state={state} selection={selected} onClose={() => setSelected(null)} setState={setState} /> : null}
       {drawer ? <Drawer drawer={drawer} onClose={() => setDrawer(null)} onSelect={setSelected} /> : null}
       {state.status === "gameover" ? (

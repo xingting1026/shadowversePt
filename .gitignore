@@ -3,3 +3,5 @@ dist/
 .DS_Store
 *.log
 match-logs/
+training-output/
+training/__pycache__/

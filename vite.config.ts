@@ -10,7 +10,7 @@ function matchLogger(): Plugin {
     name: "match-logger",
     apply: "serve",
     configureServer(server: ViteDevServer) {
-      const dir = join(__dirname, "match-logs");
+      const dir = join(import.meta.dirname, "match-logs");
       mkdirSync(dir, { recursive: true });
       server.middlewares.use("/__matchlog", (req, res) => {
         if (req.method !== "POST") {

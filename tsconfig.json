@@ -18,5 +18,5 @@
     "allowImportingTsExtensions": true,
     "types": ["vite/client", "node"]
   },
-  "include": ["src", "tests", "vite.config.ts"]
+  "include": ["src", "tests", "training-bench.ts", "training-browser-parity.ts", "training-server.ts", "training-verify-replays.ts", "vite.config.ts"]
 }
